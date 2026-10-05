@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.5.1
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -100,6 +100,7 @@
         const QUICK_SELECTOR = '#wish-rp-quick';
         const MONITOR_SELECTOR = '#wish-rp-monitor .wish-mon-core';
         const EXTRA_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="mem-extra"]`;
+        const INJECTION_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="home-injection"]`;
         const DUPLICATE_WINDOW_MS = 2500;
         const UI_TIMEOUT_MS = 8000;
 
@@ -336,17 +337,130 @@
             return true;
         }
 
+        function isInjectionActive() {
+            const root = document.querySelector(ROOT_SELECTOR);
+            return !!root?.querySelector('.m3-inject[data-act="release"]');
+        }
+
+        async function openInjectionView(chatId) {
+            assertChat(chatId, '현재 주입 확인 전');
+            const root = document.querySelector(ROOT_SELECTOR);
+            if (!root) throw new Error('WRMC UI 호환 실패: 루트 요소가 없습니다.');
+
+            const checkButton = requireUnique(
+                root,
+                '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="check"]',
+                '주입확인 탭 버튼'
+            );
+            click(checkButton, 'WRMC 주입확인 탭 열기');
+            return waitFor(() => document.querySelector(INJECTION_VIEW_SELECTOR), '주입확인 화면');
+        }
+
+        function findInjectionRows(injectionView) {
+            return [...injectionView.querySelectorAll('.m3-irow')].filter(row => (
+                row.querySelector('.m3-t > b')?.textContent === WRMC_RESERVED_SLOT_TITLE
+            ));
+        }
+
+        function previewCardTitle(card) {
+            const title = card.querySelector(':scope > summary .m3-t > b');
+            if (!title) return '';
+            const prefix = title.querySelector('.m3-pvn')?.textContent || '';
+            const text = title.textContent || '';
+            return prefix && text.startsWith(prefix) ? text.slice(prefix.length) : text;
+        }
+
+        async function readPreviewContent(chatId) {
+            assertChat(chatId, '현재 주입 원문 확인 전');
+            const root = document.querySelector(ROOT_SELECTOR);
+            const previewButton = requireUnique(root, 'button[data-act="preview"]', '주입 미리보기 버튼');
+            click(previewButton, 'WRMC 주입 미리보기 열기');
+
+            const dialog = await waitFor(() => {
+                const dialogs = [...document.querySelectorAll(
+                    `${ROOT_SELECTOR} .wish-dlg-layer > .m3-dialog:not(.m3-leaving)`
+                )];
+                return dialogs.find(item => item.querySelector('details.m3-card[data-key^="pv-"]')) || null;
+            }, '주입 미리보기');
+
+            try {
+                const cards = [...dialog.querySelectorAll('details.m3-card[data-key^="pv-"]')]
+                    .filter(card => previewCardTitle(card) === WRMC_RESERVED_SLOT_TITLE);
+                if (cards.length > 1) {
+                    throw new Error('WRMC OOC 적용 중단: 현재 주입에 예약 슬롯이 여러 개입니다.');
+                }
+                return cards[0]?.querySelector(':scope > .m3-cardbody pre.m3-block')?.textContent ?? null;
+            } finally {
+                if (dialog.isConnected) {
+                    const closeButton = requireUnique(
+                        dialog,
+                        'button[data-act="closeDlg"][data-arg]',
+                        '주입 미리보기 닫기 버튼'
+                    );
+                    click(closeButton, 'WRMC 주입 미리보기 닫기');
+                    await waitFor(() => !dialog.isConnected, '주입 미리보기 닫힘');
+                }
+            }
+        }
+
+        async function verifyCurrentInjection(content, enabled, chatId) {
+            if (!isInjectionActive()) {
+                return { active: false, reflected: true, quickExcluded: false };
+            }
+
+            const injectionView = await openInjectionView(chatId);
+            const rows = findInjectionRows(injectionView);
+            const activeRows = rows.filter(row => !row.classList.contains('is-off'));
+
+            if (!enabled) {
+                return { active: true, reflected: activeRows.length === 0, quickExcluded: false };
+            }
+            if (
+                !activeRows.length &&
+                rows.length === 1 &&
+                rows[0].classList.contains('why-me')
+            ) {
+                return { active: true, reflected: true, quickExcluded: true };
+            }
+            if (activeRows.length !== 1 || rows.length !== 1) {
+                return { active: true, reflected: false, quickExcluded: false };
+            }
+
+            const currentContent = await readPreviewContent(chatId);
+            return {
+                active: true,
+                reflected: currentContent === String(content || '').trim(),
+                quickExcluded: false,
+            };
+        }
+
+        async function refreshCurrentInjectionViaSlotSave(content, chatId) {
+            const extraView = await openExtraView(chatId);
+            const slot = findModelOocSlot(extraView);
+            if (!slot) throw new Error('WRMC 현재 주입 갱신 전 예약 슬롯을 확인하지 못했습니다.');
+            return setSlotContent({ slot, editor: null, created: false }, content, chatId, true);
+        }
+
         async function restoreUiState(initialState) {
             const root = document.querySelector(ROOT_SELECTOR);
 
             if (initialState.panelOpen && document.querySelector(PANEL_SELECTOR) && root) {
-                if (initialState.activeNav === 'memory' && initialState.activeMemorySub && initialState.activeMemorySub !== 'extra') {
-                    const subButton = requireUnique(
+                if (initialState.activeNav === 'memory') {
+                    const memoryButton = requireUnique(
                         root,
-                        `button[data-act="memSub"][data-arg="${initialState.activeMemorySub}"]`,
-                        '기억 하위 탭 복원 버튼'
+                        '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="memory"]',
+                        '기억 탭 복원 버튼'
                     );
-                    click(subButton, 'WRMC 기억 하위 탭 복원');
+                    click(memoryButton, 'WRMC 기억 탭 복원');
+                    if (initialState.activeMemorySub) {
+                        const subButton = await waitFor(() => {
+                            const buttons = [...root.querySelectorAll(
+                                `button[data-act="memSub"][data-arg="${initialState.activeMemorySub}"]`
+                            )];
+                            return buttons.length === 1 ? buttons[0] : null;
+                        }, '기억 하위 탭 복원 버튼');
+                        click(subButton, 'WRMC 기억 하위 탭 복원');
+                    }
                 } else if (initialState.activeNav && initialState.activeNav !== 'memory') {
                     const navButton = requireUnique(
                         root,
@@ -399,14 +513,37 @@
                 assertChat(request.chatId, '예약 슬롯 최종 적용 전');
                 await setSlotEnabled(slotState.slot, enabled, request.chatId);
 
-                console.log('[모델별 프리셋/WRMC] 모델별 OOC 적용 완료', {
+                let injection = await verifyCurrentInjection(content, enabled, request.chatId);
+                if (injection.active && !injection.reflected) {
+                    const refreshContent = enabled ? content : slotState.slot.content;
+                    await refreshCurrentInjectionViaSlotSave(refreshContent, request.chatId);
+                    injection = await verifyCurrentInjection(content, enabled, request.chatId);
+                }
+                if (injection.active && !injection.reflected) {
+                    throw new Error('WRMC OOC 저장은 완료했지만 현재 주입 반영을 확인하지 못했습니다.');
+                }
+
+                const message = !injection.active
+                    ? (enabled
+                        ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 다음 주입 시작 시 포함'
+                        : '[모델별 프리셋/WRMC] OOC 저장 완료 · 주입 OFF')
+                    : injection.quickExcluded
+                        ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 현재 주입의 사용자 제외 유지'
+                        : '[모델별 프리셋/WRMC] 모델별 OOC 적용 및 현재 주입 반영 완료';
+                console.log(message, {
                     chatId: request.chatId,
                     mode: request.mode,
                     enabled,
                     length: countChars(content),
                     runtime: initialState.runtime,
                 });
-                return { applied: true, enabled };
+                return {
+                    applied: true,
+                    enabled,
+                    injectionActive: injection.active,
+                    injectionReflected: injection.reflected,
+                    quickExcluded: injection.quickExcluded,
+                };
             } finally {
                 try {
                     await restoreUiState(initialState);
@@ -453,6 +590,7 @@
             ensureModelOocSlot,
             setSlotContent,
             setSlotEnabled,
+            verifyCurrentInjection,
             applyPreset,
         };
     })();
