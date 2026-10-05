@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.5
+// @version      1.5.6
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -111,6 +111,7 @@
         const QUICK_USER_EXCLUDED_REASON = '이번 세션에서 직접 제외';
         const DUPLICATE_WINDOW_MS = 2500;
         const UI_TIMEOUT_MS = 8000;
+        const WRMC_BOOT_WAIT_MS = 3000;
         // WRMC 저장/토글은 현재 주입(carrier) 재구성을 비동기로 끝낸다. 서버 PATCH·검증까지 기다린다.
         const SYNC_TIMEOUT_MS = 45000;
         const INJECTION_WAIT_MS = 30000;
@@ -126,8 +127,37 @@
             return document.documentElement?.getAttribute(RUNTIME_ATTR) || '';
         }
 
+        /**
+         * WRMC 설치 판정: runtime marker(<html data-wish-rp-runtime>)는 Crack 쪽 렌더로 사라질 수 있어
+         * 진단용으로만 쓴다. 실제 판정은 WRMC가 직접 만드는 UI 두 가지 이상의 조합이다.
+         * - #wish-rp-root (WRMC ensureRoot()가 생성)
+         * - AND 다음 중 하나:
+         *   · root 직속 .wish-dlg-layer[data-key="dl"] + .wish-toast-wrap[data-key="tw"] (WRMC vRoot()가 매 렌더 출력)
+         *   · #wish-rp-monitor .wish-mon-core (채팅방 상태 모니터)
+         *   · 전체 패널 주 메뉴 [data-key="shell-layout"] nav[aria-label="주 메뉴"]
+         */
+        function detectWrmcUi() {
+            const root = document.querySelector(ROOT_SELECTOR);
+            const layers = !!root?.querySelector(':scope > .wish-dlg-layer[data-key="dl"]') &&
+                !!root?.querySelector(':scope > .wish-toast-wrap[data-key="tw"]');
+            const monitor = !!document.querySelector(MONITOR_SELECTOR);
+            const shell = !!root?.querySelector('[data-key="shell-layout"] nav[aria-label="주 메뉴"]');
+            return { root: !!root, layers, monitor, shell, runtime: runtimeMarker() };
+        }
+
         function isAvailable() {
-            return !!runtimeMarker();
+            const ui = detectWrmcUi();
+            return ui.root && (ui.layers || ui.monitor || ui.shell);
+        }
+
+        /** WRMC가 아직 부팅 중일 수 있으므로 짧게만 기다린다(무한 대기 없음). */
+        async function waitForWrmcUi() {
+            const deadline = Date.now() + WRMC_BOOT_WAIT_MS;
+            while (!isAvailable()) {
+                if (Date.now() >= deadline) return false;
+                await delay(100);
+            }
+            return true;
         }
 
         function getUiState() {
@@ -864,7 +894,9 @@
         }
 
         async function applyInternal(request) {
-            if (!isAvailable()) return { applied: false, reason: 'not-installed' };
+            const available = await waitForWrmcUi();
+            console.log('[WRMC OOC] isAvailable=' + available, detectWrmcUi());
+            if (!available) return { applied: false, reason: 'not-installed' };
 
             const initialState = getUiState();
             const content = String(request.content || '');
