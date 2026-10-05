@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.2
+// @version      1.5.3
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -103,7 +103,12 @@
         const INJECTION_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="home-injection"]`;
         const TOAST_SELECTOR = `${ROOT_SELECTOR} .wish-toast-wrap .m3-toast`;
         const VERIFIED_INJECTION_LABEL = '확인된 주입 항목';
-        const SYNC_FAILED_TOAST_TEXT = '주입 재적용 대기';
+        // WUISyncMemoryEdit 실패 notify는 WLOG.short()를 거쳐 "[기억은 저장됨] <오류>"로 표시된다.
+        const SYNC_FAILED_TOAST_PATTERN = /주입 재적용 대기|^\s*\[기억은 저장됨\]/;
+        const INJECT_RELEASE_SELECTOR = '.m3-inject[data-act="release"]';
+        const INJECT_ARM_SELECTOR = '.m3-inject[data-act="arm"]';
+        const QUICK_ITEM_BIND_PREFIX = 'quick.item:';
+        const QUICK_USER_EXCLUDED_REASON = '이번 세션에서 직접 제외';
         const DUPLICATE_WINDOW_MS = 2500;
         const UI_TIMEOUT_MS = 8000;
         // WRMC 저장/토글은 현재 주입(carrier) 재구성을 비동기로 끝낸다. 서버 PATCH·검증까지 기다린다.
@@ -347,7 +352,7 @@
 
         function isInjectionActive() {
             const root = document.querySelector(ROOT_SELECTOR);
-            return !!root?.querySelector('.m3-inject[data-act="release"]');
+            return !!root?.querySelector(INJECT_RELEASE_SELECTOR);
         }
 
         async function openInjectionView(chatId) {
@@ -458,7 +463,7 @@
 
         function newSyncFailureToast(knownToasts) {
             return [...document.querySelectorAll(TOAST_SELECTOR)].some(toast => (
-                !knownToasts.has(toast) && String(toast.textContent || '').includes(SYNC_FAILED_TOAST_TEXT)
+                !knownToasts.has(toast) && SYNC_FAILED_TOAST_PATTERN.test(String(toast.textContent || ''))
             ));
         }
 
@@ -499,10 +504,12 @@
                 const settled = rowsReady && (panel.verified || (!enabled && !panel.totalRows));
                 const timedOut = Date.now() >= deadline;
                 const syncFailed = newSyncFailureToast(knownToasts);
+                // 예약 슬롯이 현재 주입 세션에 들어 있는지(본문만 이전 값인지)를 fallback 선택에 쓴다.
+                const reservedActive = panel.activeRows.length > 0;
 
                 if (settled || timedOut || syncFailed) {
                     if (!rowsReady) {
-                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false };
+                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false, reservedActive };
                     }
                     const preview = await readInjectionPreview(chatId);
                     return {
@@ -510,6 +517,7 @@
                         reflected: judgeInjection(preview, content, enabled),
                         quickExcluded: false,
                         carrierVerified: settled,
+                        reservedActive,
                     };
                 }
                 await delay(INJECTION_POLL_MS);
@@ -521,6 +529,159 @@
             const slot = findModelOocSlot(extraView);
             if (!slot) throw new Error('WRMC 현재 주입 갱신 전 예약 슬롯을 확인하지 못했습니다.');
             return setSlotContent({ slot, editor: null, created: false }, content, chatId, true);
+        }
+
+        function injectButton(selector) {
+            const root = document.querySelector(ROOT_SELECTOR);
+            const buttons = root ? [...root.querySelectorAll(selector)] : [];
+            if (buttons.length > 1) {
+                throw new Error(`WRMC UI 호환 실패: 주입 버튼(${selector}) 요소가 ${buttons.length}개입니다.`);
+            }
+            return buttons[0] || null;
+        }
+
+        function newErrorToast(knownToasts) {
+            return [...document.querySelectorAll(TOAST_SELECTOR)]
+                .find(toast => !knownToasts.has(toast) && toast.classList.contains('error')) || null;
+        }
+
+        /** WRMC footer 버튼이 원하는 상태(release/arm)로 바뀌고 작업 중(disabled)이 끝날 때까지 기다린다. */
+        function waitForInjectButton(selector, description, knownToasts) {
+            return waitFor(() => {
+                const failure = newErrorToast(knownToasts);
+                if (failure) {
+                    throw new Error(`${description} 실패: ${String(failure.textContent || '').trim()}`);
+                }
+                const button = injectButton(selector);
+                return button && !button.disabled ? button : null;
+            }, description, SYNC_TIMEOUT_MS);
+        }
+
+        async function withQuickPanel(chatId, work) {
+            assertChat(chatId, 'WRMC 빠른 패널 열기 전');
+            const wasOpen = !!document.querySelector(QUICK_SELECTOR);
+            if (!wasOpen) {
+                const monitor = await waitFor(() => document.querySelector(MONITOR_SELECTOR), '상태 모니터');
+                click(monitor, 'WRMC 빠른 패널 열기');
+            }
+            await waitFor(() => document.querySelector(QUICK_SELECTOR), '빠른 패널');
+            try {
+                return await work();
+            } finally {
+                const quick = document.querySelector(QUICK_SELECTOR);
+                if (!wasOpen && quick) {
+                    click(requireUnique(quick, 'button[data-act="quickClose"]', '빠른 패널 닫기 버튼'), 'WRMC 빠른 패널 닫기');
+                    await waitFor(() => !document.querySelector(QUICK_SELECTOR), '빠른 패널 닫힘');
+                }
+            }
+        }
+
+        /** 빠른 패널의 일반 항목 체크박스. key는 WRMC pendingItemIdentity()와 같은 identity다. */
+        function readQuickItems() {
+            const quick = document.querySelector(QUICK_SELECTOR);
+            if (!quick) return [];
+            return [...quick.querySelectorAll('label.wq-row')].map(row => {
+                const input = row.querySelector('input[type="checkbox"][data-bind]');
+                const bind = input?.getAttribute('data-bind') || '';
+                if (!bind.startsWith(QUICK_ITEM_BIND_PREFIX)) return null;
+                const reason = String(row.querySelector('.m3-t > small')?.textContent || '');
+                return {
+                    key: bind.slice(QUICK_ITEM_BIND_PREFIX.length),
+                    title: row.querySelector('.m3-t > b')?.textContent || '',
+                    input,
+                    checked: !!input.checked,
+                    userExcluded: !input.checked && reason.startsWith(QUICK_USER_EXCLUDED_REASON),
+                };
+            }).filter(item => item && item.key);
+        }
+
+        /** 재시작 전에 이번 세션에서 사용자가 빠른 패널로 직접 끈 항목의 identity만 모은다. */
+        async function captureQuickExclusions(chatId, reservedKey) {
+            return withQuickPanel(chatId, async () => {
+                const seen = new Set();
+                return readQuickItems()
+                    .filter(item => item.userExcluded && item.key !== reservedKey)
+                    .filter(item => !seen.has(item.key) && seen.add(item.key))
+                    .map(item => ({ key: item.key, title: item.title }));
+            });
+        }
+
+        /** 새 세션의 빠른 패널에서 identity가 정확히 같은 항목만 공식 체크박스로 다시 끈다. */
+        async function restoreQuickExclusions(chatId, preserved) {
+            const result = { restored: [], alreadyOff: [], lost: [], unconfirmed: [] };
+            if (!preserved.length) return result;
+
+            await withQuickPanel(chatId, async () => {
+                for (const item of preserved) {
+                    assertChat(chatId, '빠른 제외 복원 중');
+                    const match = readQuickItems().find(row => row.key === item.key);
+                    if (!match) {
+                        result.lost.push(item);
+                    } else if (!match.checked) {
+                        result.alreadyOff.push(item);
+                    } else if (match.input.disabled) {
+                        result.lost.push(item);
+                    } else {
+                        click(match.input, 'WRMC 빠른 제외 복원');
+                        result.restored.push(item);
+                    }
+                }
+                if (!result.restored.length) return;
+                try {
+                    await waitFor(() => {
+                        const rows = readQuickItems();
+                        return result.restored.every(item => rows.some(row => row.key === item.key && row.userExcluded));
+                    }, '빠른 제외 복원 반영', SYNC_TIMEOUT_MS);
+                } catch {
+                    const rows = readQuickItems();
+                    result.unconfirmed = result.restored
+                        .filter(item => !rows.some(row => row.key === item.key && row.userExcluded));
+                }
+            });
+
+            if (result.lost.length || result.unconfirmed.length) {
+                console.warn('[모델별 프리셋/WRMC] 주입 재시작 후 일부 빠른 제외를 보존하지 못했습니다.', {
+                    lost: result.lost,
+                    unconfirmed: result.unconfirmed,
+                });
+            }
+            return result;
+        }
+
+        /**
+         * 현재 pending에 예약 OOC가 없어서(또는 꺼졌는데 남아 있어서) WRMC 저장·토글 sync로 고칠 수 없을 때만,
+         * WRMC footer의 공식 [주입 해제] → [주입 시작] 버튼으로 새 주입 snapshot을 만든다.
+         */
+        async function restartInjectionForReservedSlot(chatId, reservedKey, { allowArmFailure = false } = {}) {
+            assertChat(chatId, '주입 재시작 전');
+            const preserved = await captureQuickExclusions(chatId, reservedKey);
+            console.log('[모델별 프리셋/WRMC] 예약 OOC 반영을 위해 WRMC 주입을 재시작합니다.', {
+                chatId,
+                preservedQuickExclusions: preserved.length,
+                note: '인지 개별 선택(이번 턴만)은 자동 선택과 구분되지 않아 재시작 후 WRMC 기본값을 사용합니다.',
+            });
+
+            assertChat(chatId, '주입 해제 전');
+            let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
+            const releaseButton = await waitForInjectButton(INJECT_RELEASE_SELECTOR, 'WRMC 주입 해제 준비', knownToasts);
+            click(releaseButton, 'WRMC 주입 해제');
+            await waitForInjectButton(INJECT_ARM_SELECTOR, 'WRMC 주입 해제', knownToasts);
+
+            assertChat(chatId, '주입 시작 전');
+            knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
+            const armButton = injectButton(INJECT_ARM_SELECTOR);
+            click(armButton, 'WRMC 주입 시작');
+            try {
+                await waitForInjectButton(INJECT_RELEASE_SELECTOR, 'WRMC 주입 시작', knownToasts);
+            } catch (error) {
+                if (allowArmFailure) {
+                    console.warn('[모델별 프리셋/WRMC] 예약 OOC 제거 후 주입할 항목이 없어 WRMC 주입이 꺼진 상태입니다.', error);
+                    return { armed: false, preserved };
+                }
+                throw new Error(`${error.message} · WRMC 주입이 해제된 상태입니다. WRMC에서 [주입 시작]을 직접 눌러 주세요.`);
+            }
+            assertChat(chatId, '주입 시작 후');
+            return { armed: true, preserved };
         }
 
         async function restoreUiState(initialState) {
@@ -598,13 +759,35 @@
                 await setSlotEnabled(slotState.slot, enabled, request.chatId);
 
                 let injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
-                if (injection.active && !injection.reflected) {
-                    // WRMC 동기화가 보류·실패한 경우에만 같은 슬롯을 공식 편집창으로 다시 저장해
-                    // WUISyncMemoryEdit → reconcileStableCarrier를 한 번 더 실행시킨다.
+                if (injection.active && !injection.reflected && enabled && injection.reservedActive) {
+                    // 예약 슬롯은 현재 주입에 있고 본문만 이전 값: 공식 편집 저장 sync를 한 번만 다시 쓴다.
                     knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-                    const refreshContent = enabled ? content : slotState.slot.content;
-                    await refreshCurrentInjectionViaSlotSave(refreshContent, request.chatId);
+                    await refreshCurrentInjectionViaSlotSave(content, request.chatId);
                     injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
+                }
+
+                let restart = null;
+                let quickRestore = null;
+                if (injection.active && !injection.reflected) {
+                    // 예약 슬롯이 현재 주입 세션에 없거나(enabled), 꺼졌는데 남아 있음(disabled):
+                    // 저장·토글 sync로는 고쳐지지 않으므로 공식 [주입 해제] → [주입 시작]으로 새 snapshot을 만든다.
+                    restart = await restartInjectionForReservedSlot(
+                        request.chatId,
+                        `slot:${slotState.slot.slotId}`,
+                        { allowArmFailure: !enabled }
+                    );
+                    injection = restart.armed
+                        ? await verifyCurrentInjection(content, enabled, request.chatId)
+                        : { active: false, reflected: true, quickExcluded: false, carrierVerified: false };
+                    if (injection.active && injection.reflected && restart.preserved.length) {
+                        quickRestore = await restoreQuickExclusions(request.chatId, restart.preserved);
+                        if (quickRestore.restored.length) {
+                            injection = await verifyCurrentInjection(content, enabled, request.chatId);
+                        }
+                    }
+                    if (enabled && !injection.active) {
+                        throw new Error('WRMC 주입 재시작 후 주입이 활성화되지 않았습니다. WRMC에서 [주입 시작]을 직접 눌러 주세요.');
+                    }
                 }
                 if (injection.active && !injection.reflected) {
                     throw new Error(enabled
@@ -615,7 +798,9 @@
                 const message = !injection.active
                     ? (enabled
                         ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 다음 주입 시작 시 포함'
-                        : '[모델별 프리셋/WRMC] OOC 저장 완료 · 주입 OFF')
+                        : restart
+                            ? '[모델별 프리셋/WRMC] OOC 주입 OFF · 남은 주입 항목이 없어 WRMC 주입 꺼짐'
+                            : '[모델별 프리셋/WRMC] OOC 저장 완료 · 주입 OFF')
                     : injection.quickExcluded
                         ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 현재 주입의 사용자 제외 유지'
                         : injection.carrierVerified
@@ -627,6 +812,8 @@
                     enabled,
                     length: countChars(content),
                     runtime: initialState.runtime,
+                    injectionRestarted: !!restart,
+                    quickRestore,
                 });
                 return {
                     applied: true,
@@ -635,6 +822,8 @@
                     injectionReflected: injection.reflected,
                     carrierVerified: injection.carrierVerified,
                     quickExcluded: injection.quickExcluded,
+                    injectionRestarted: !!restart,
+                    quickRestore,
                 };
             } finally {
                 try {
