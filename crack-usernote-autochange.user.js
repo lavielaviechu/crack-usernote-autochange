@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.1
+// @version      1.5.2
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -101,8 +101,15 @@
         const MONITOR_SELECTOR = '#wish-rp-monitor .wish-mon-core';
         const EXTRA_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="mem-extra"]`;
         const INJECTION_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="home-injection"]`;
+        const TOAST_SELECTOR = `${ROOT_SELECTOR} .wish-toast-wrap .m3-toast`;
+        const VERIFIED_INJECTION_LABEL = '확인된 주입 항목';
+        const SYNC_FAILED_TOAST_TEXT = '주입 재적용 대기';
         const DUPLICATE_WINDOW_MS = 2500;
         const UI_TIMEOUT_MS = 8000;
+        // WRMC 저장/토글은 현재 주입(carrier) 재구성을 비동기로 끝낸다. 서버 PATCH·검증까지 기다린다.
+        const SYNC_TIMEOUT_MS = 45000;
+        const INJECTION_WAIT_MS = 30000;
+        const INJECTION_POLL_MS = 400;
 
         let applyQueue = Promise.resolve();
         let lastApplyKey = '';
@@ -310,7 +317,8 @@
             setNativeValue(contentInput, content);
             assertChat(chatId, '예약 슬롯 저장 전');
             click(saveButton, 'WRMC 예약 슬롯 저장');
-            await waitFor(() => !editor.isConnected, '예약 슬롯 저장 완료');
+            // WRMC 편집창은 저장 + 현재 주입 동기화(WUISyncMemoryEdit)가 끝난 뒤에 닫힌다.
+            await waitFor(() => !editor.isConnected, '예약 슬롯 저장 완료', SYNC_TIMEOUT_MS);
 
             const extraView = await waitFor(
                 () => document.querySelector(EXTRA_VIEW_SELECTOR),
@@ -362,6 +370,31 @@
             ));
         }
 
+        function readInjectionPanel(injectionView) {
+            const rows = findInjectionRows(injectionView);
+            return {
+                rows,
+                activeRows: rows.filter(row => !row.classList.contains('is-off')),
+                totalRows: injectionView.querySelectorAll('.m3-irow').length,
+                // WRMC는 현재 구성이 저장된 carrier와 같고 서버 검증까지 끝났을 때만 이 제목을 쓴다.
+                verified: injectionView.querySelector(':scope > .m3-row > b')?.textContent === VERIFIED_INJECTION_LABEL,
+            };
+        }
+
+        // WRMC contextItemSection()/safeForHtmlComment()와 같은 규칙으로 기대 섹션을 만든다.
+        const ZERO_WIDTH_SPACE = String.fromCharCode(0x200B);
+        function commentSafe(text) {
+            return String(text || '').replace(/<!--/g, '<' + ZERO_WIDTH_SPACE + '!--').replace(/-->/g, '--' + ZERO_WIDTH_SPACE + '>');
+        }
+
+        function reservedSectionHeading() {
+            return `### ${commentSafe(WRMC_RESERVED_SLOT_TITLE)}\n`;
+        }
+
+        function expectedReservedSection(content) {
+            return reservedSectionHeading() + commentSafe(String(content || '').trim());
+        }
+
         function previewCardTitle(card) {
             const title = card.querySelector(':scope > summary .m3-t > b');
             if (!title) return '';
@@ -370,68 +403,117 @@
             return prefix && text.startsWith(prefix) ? text.slice(prefix.length) : text;
         }
 
-        async function readPreviewContent(chatId) {
+        function openDialogs() {
+            return [...document.querySelectorAll(`${ROOT_SELECTOR} .wish-dlg-layer > .m3-dialog:not(.m3-leaving)`)];
+        }
+
+        async function closeDialog(dialog, description) {
+            if (!dialog.isConnected) return;
+            // WRMC 시트는 헤더 아이콘과 푸터에 같은 closeDlg 버튼을 둔다.
+            const dialogId = dialog.dataset?.dlg || '';
+            const closeButton = [...dialog.querySelectorAll('button[data-act="closeDlg"][data-arg]')]
+                .find(button => !dialogId || button.dataset.arg === dialogId);
+            click(closeButton, `WRMC ${description} 닫기`);
+            await waitFor(() => !dialog.isConnected, `${description} 닫힘`);
+        }
+
+        /**
+         * WRMC 주입 미리보기(카드별 원문)와 그 안의 [전체 원문] 뷰어를 공식 UI로 열어 읽는다.
+         * 전체 원문은 WRMC가 실제 carrier에 넣는 context block과 같은 formatter 결과다.
+         */
+        async function readInjectionPreview(chatId) {
             assertChat(chatId, '현재 주입 원문 확인 전');
             const root = document.querySelector(ROOT_SELECTOR);
             const previewButton = requireUnique(root, 'button[data-act="preview"]', '주입 미리보기 버튼');
             click(previewButton, 'WRMC 주입 미리보기 열기');
 
-            const dialog = await waitFor(() => {
-                const dialogs = [...document.querySelectorAll(
-                    `${ROOT_SELECTOR} .wish-dlg-layer > .m3-dialog:not(.m3-leaving)`
-                )];
-                return dialogs.find(item => item.querySelector('details.m3-card[data-key^="pv-"]')) || null;
-            }, '주입 미리보기');
+            const dialog = await waitFor(
+                () => openDialogs().find(item => item.querySelector('button[data-act="viewer"]')) || null,
+                '주입 미리보기'
+            );
 
             try {
-                const cards = [...dialog.querySelectorAll('details.m3-card[data-key^="pv-"]')]
+                const cards = [...dialog.querySelectorAll('details.m3-card[data-key^="k-pv-"]')]
                     .filter(card => previewCardTitle(card) === WRMC_RESERVED_SLOT_TITLE);
                 if (cards.length > 1) {
                     throw new Error('WRMC OOC 적용 중단: 현재 주입에 예약 슬롯이 여러 개입니다.');
                 }
-                return cards[0]?.querySelector(':scope > .m3-cardbody pre.m3-block')?.textContent ?? null;
-            } finally {
-                if (dialog.isConnected) {
-                    const closeButton = requireUnique(
-                        dialog,
-                        'button[data-act="closeDlg"][data-arg]',
-                        '주입 미리보기 닫기 버튼'
-                    );
-                    click(closeButton, 'WRMC 주입 미리보기 닫기');
-                    await waitFor(() => !dialog.isConnected, '주입 미리보기 닫힘');
+                const cardContent = cards[0]?.querySelector(':scope > .m3-cardbody pre.m3-block')?.textContent ?? null;
+
+                click(requireUnique(dialog, 'button[data-act="viewer"]', '전체 원문 버튼'), 'WRMC 주입 전체 원문 열기');
+                const viewer = await waitFor(
+                    () => openDialogs().find(item => item !== dialog && item.querySelector('pre.m3-block.tall')) || null,
+                    '주입 전체 원문'
+                );
+                try {
+                    const fullText = viewer.querySelector('pre.m3-block.tall')?.textContent ?? '';
+                    return { cardContent, fullText };
+                } finally {
+                    await closeDialog(viewer, '주입 전체 원문');
                 }
+            } finally {
+                await closeDialog(dialog, '주입 미리보기');
             }
         }
 
-        async function verifyCurrentInjection(content, enabled, chatId) {
-            if (!isInjectionActive()) {
-                return { active: false, reflected: true, quickExcluded: false };
-            }
+        function newSyncFailureToast(knownToasts) {
+            return [...document.querySelectorAll(TOAST_SELECTOR)].some(toast => (
+                !knownToasts.has(toast) && String(toast.textContent || '').includes(SYNC_FAILED_TOAST_TEXT)
+            ));
+        }
 
-            const injectionView = await openInjectionView(chatId);
-            const rows = findInjectionRows(injectionView);
-            const activeRows = rows.filter(row => !row.classList.contains('is-off'));
+        function judgeInjection(preview, content, enabled) {
+            if (!enabled) return !preview.fullText.includes(reservedSectionHeading());
+            return preview.cardContent === String(content || '').trim() &&
+                preview.fullText.includes(expectedReservedSection(content));
+        }
 
-            if (!enabled) {
-                return { active: true, reflected: activeRows.length === 0, quickExcluded: false };
-            }
-            if (
-                !activeRows.length &&
-                rows.length === 1 &&
-                rows[0].classList.contains('why-me')
-            ) {
-                return { active: true, reflected: true, quickExcluded: true };
-            }
-            if (activeRows.length !== 1 || rows.length !== 1) {
-                return { active: true, reflected: false, quickExcluded: false };
-            }
+        /**
+         * WRMC 토글/저장은 화면 상태를 먼저 바꾸고 현재 주입 재구성(reconcileStableCarrier)은
+         * 서버 PATCH·검증 뒤에 끝난다. 주입확인 화면을 다시 그리며 그 완료를 기다린 뒤,
+         * 주입 미리보기 카드와 전체 원문에 예약 슬롯 제목·본문이 실제로 있는지 확인한다.
+         */
+        async function verifyCurrentInjection(content, enabled, chatId, knownToasts = new Set()) {
+            const inactive = { active: false, reflected: true, quickExcluded: false, carrierVerified: false };
+            if (!isInjectionActive()) return inactive;
 
-            const currentContent = await readPreviewContent(chatId);
-            return {
-                active: true,
-                reflected: currentContent === String(content || '').trim(),
-                quickExcluded: false,
-            };
+            const deadline = Date.now() + INJECTION_WAIT_MS;
+            while (true) {
+                assertChat(chatId, '현재 주입 반영 확인 중');
+                if (!isInjectionActive()) return inactive;
+
+                // 주입확인 탭을 다시 누르면 WRMC가 최신 pending으로 화면을 다시 그린다.
+                const panel = readInjectionPanel(await openInjectionView(chatId));
+                if (
+                    enabled &&
+                    !panel.activeRows.length &&
+                    panel.rows.length === 1 &&
+                    panel.rows[0].classList.contains('why-me')
+                ) {
+                    return { active: true, reflected: true, quickExcluded: true, carrierVerified: panel.verified };
+                }
+
+                const rowsReady = enabled
+                    ? panel.activeRows.length === 1 && panel.rows.length === 1
+                    : !panel.activeRows.length;
+                const settled = rowsReady && (panel.verified || (!enabled && !panel.totalRows));
+                const timedOut = Date.now() >= deadline;
+                const syncFailed = newSyncFailureToast(knownToasts);
+
+                if (settled || timedOut || syncFailed) {
+                    if (!rowsReady) {
+                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false };
+                    }
+                    const preview = await readInjectionPreview(chatId);
+                    return {
+                        active: true,
+                        reflected: judgeInjection(preview, content, enabled),
+                        quickExcluded: false,
+                        carrierVerified: settled,
+                    };
+                }
+                await delay(INJECTION_POLL_MS);
+            }
         }
 
         async function refreshCurrentInjectionViaSlotSave(content, chatId) {
@@ -511,16 +593,23 @@
                 }
 
                 assertChat(request.chatId, '예약 슬롯 최종 적용 전');
+                // 토글의 비동기 주입 재구성이 실패하면 WRMC가 새 경고 토스트를 띄운다.
+                let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
                 await setSlotEnabled(slotState.slot, enabled, request.chatId);
 
-                let injection = await verifyCurrentInjection(content, enabled, request.chatId);
+                let injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
                 if (injection.active && !injection.reflected) {
+                    // WRMC 동기화가 보류·실패한 경우에만 같은 슬롯을 공식 편집창으로 다시 저장해
+                    // WUISyncMemoryEdit → reconcileStableCarrier를 한 번 더 실행시킨다.
+                    knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
                     const refreshContent = enabled ? content : slotState.slot.content;
                     await refreshCurrentInjectionViaSlotSave(refreshContent, request.chatId);
-                    injection = await verifyCurrentInjection(content, enabled, request.chatId);
+                    injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
                 }
                 if (injection.active && !injection.reflected) {
-                    throw new Error('WRMC OOC 저장은 완료했지만 현재 주입 반영을 확인하지 못했습니다.');
+                    throw new Error(enabled
+                        ? 'WRMC OOC 저장은 완료했지만 주입확인에 예약 OOC 제목·본문이 나타나지 않았습니다.'
+                        : 'WRMC OOC 주입 OFF는 저장했지만 주입확인에서 예약 OOC가 제거되지 않았습니다.');
                 }
 
                 const message = !injection.active
@@ -529,7 +618,9 @@
                         : '[모델별 프리셋/WRMC] OOC 저장 완료 · 주입 OFF')
                     : injection.quickExcluded
                         ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 현재 주입의 사용자 제외 유지'
-                        : '[모델별 프리셋/WRMC] 모델별 OOC 적용 및 현재 주입 반영 완료';
+                        : injection.carrierVerified
+                            ? '[모델별 프리셋/WRMC] 모델별 OOC 적용 및 현재 주입 반영 완료'
+                            : '[모델별 프리셋/WRMC] 모델별 OOC 주입확인 반영 · WRMC 서버 저장 확인 대기';
                 console.log(message, {
                     chatId: request.chatId,
                     mode: request.mode,
@@ -542,6 +633,7 @@
                     enabled,
                     injectionActive: injection.active,
                     injectionReflected: injection.reflected,
+                    carrierVerified: injection.carrierVerified,
                     quickExcluded: injection.quickExcluded,
                 };
             } finally {
