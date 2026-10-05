@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.6
-// @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
+// @version      2.0
+// @description  Crack 유저노트 창에서 채팅방별 모델 프리셋을 편집하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -15,28 +15,24 @@
 
     const API_BASE = 'https://crack-api.wrtn.ai/crack-gen';
 
-    const BTN_POS_KEY_X = 'crack_mode_user_note_btn_x';
-    const BTN_POS_KEY_Y = 'crack_mode_user_note_btn_y';
-    const PANEL_OPEN_KEY = 'crack_mode_user_note_panel_open_v3';
     const MODE_NOTES_KEY_PREFIX = 'crack_mode_user_notes_v3';
     const LAST_APPLIED_NOTE_KEY = 'crack_last_applied_mode_user_note_v3';
-    const WRMC_RESERVED_SLOT_TITLE = '🔄 모델별 OOC [AUTO]';
 
     const CHAT_MODES = [
-        { key: 'hyperchat_4_0', label: '하이퍼챗 4.0' },
-        { key: 'hyperchat_3_0', label: '하이퍼챗 3.0' },
-        { key: 'hyperchat_2_0', label: '하이퍼챗 2.0' },
-        { key: 'hyperchat_1_5', label: '하이퍼챗 1.5' },
-        { key: 'hyperchat', label: '하이퍼챗' },
-        { key: 'fablechat_1_0', label: '페이블챗 1.0' },
-        { key: 'prochat_2_5', label: '프로챗 2.5' },
-        { key: 'prochat_1_0', label: '프로챗 1.0' },
+        { key: 'fablechat_1_0', label: '페이블챗 1.0', shortLabel: 'Fable' },
+        { key: 'hyperchat_4_0', label: '하이퍼챗 4.0', shortLabel: 'H4' },
+        { key: 'hyperchat_3_0', label: '하이퍼챗 3.0', shortLabel: 'H3' },
+        { key: 'hyperchat_2_0', label: '하이퍼챗 2.0', shortLabel: 'H2' },
+        { key: 'hyperchat_1_5', label: '하이퍼챗 1.5', shortLabel: 'H1.5' },
+        { key: 'hyperchat', label: '하이퍼챗', shortLabel: 'Hyper' },
+        { key: 'prochat_2_5', label: '프로챗 2.5', shortLabel: 'Pro2.5' },
+        { key: 'prochat_1_0', label: '프로챗 1.0', shortLabel: 'Pro1.0' },
     ];
 
     let lastAutoAppliedModeKey = '';
     let lastAutoApplyAt = 0;
     let lastDetectedChatId = '';
-    let lastDetectedChatMode = '';
+    let lastDetectedModeKey = '';
 
     let lastAppliedUserNoteContent = '';
     let lastAppliedUserNoteIsExtend = false;
@@ -52,9 +48,15 @@
 
     let saveInterceptorAttached = false;
     let saveCommitTimer = null;
+    let lastPresetSaveInterceptAt = 0;
 
     let internalPatchInProgress = false;
     let pendingUserNotePatchMode = null;
+
+    let editorSession = null;
+    let currentServerUserNote = null;
+    let currentEditorDraft = null;
+    const presetEditorDrafts = new Map();
 
     function parseChatId() {
         const m = location.pathname.match(/\/stories\/[^/]+\/episodes\/([^/?#]+)/);
@@ -74,1059 +76,38 @@
         return CHAT_MODES.find(mode => mode.key === modeKey)?.label || modeKey;
     }
 
-    function normalizeModePreset(value = {}) {
-        const preset = value && typeof value === 'object' ? value : {};
-
-        return {
-            content: typeof preset.content === 'string' ? preset.content : '',
-            isExtend: !!preset.isExtend,
-            wrmcOocContent: typeof preset.wrmcOocContent === 'string'
-                ? preset.wrmcOocContent
-                : '',
-            wrmcOocEnabled: !!preset.wrmcOocEnabled,
-            updatedAt: preset.updatedAt || null,
-        };
-    }
-
-    /**
-     * WRMC 본체를 수정하지 않고, WRMC가 이미 제공하는 UI/action 경로만 이용한다.
-     * 예약 제목이 정확히 일치하는 기타·OOC 슬롯 하나만 소유하며, 선택자가 달라지면
-     * 다른 슬롯을 추측하지 않고 적용을 중단한다.
-     */
-    const WrmcAdapter = (() => {
-        const RUNTIME_ATTR = 'data-wish-rp-runtime';
-        const ROOT_SELECTOR = '#wish-rp-root';
-        const PANEL_SELECTOR = `${ROOT_SELECTOR} .m3-overlay .m3-shell[role="dialog"]`;
-        const QUICK_SELECTOR = '#wish-rp-quick';
-        const MONITOR_SELECTOR = '#wish-rp-monitor .wish-mon-core';
-        const EXTRA_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="mem-extra"]`;
-        const INJECTION_VIEW_SELECTOR = `${ROOT_SELECTOR} [data-key="home-injection"]`;
-        const TOAST_SELECTOR = `${ROOT_SELECTOR} .wish-toast-wrap .m3-toast`;
-        const VERIFIED_INJECTION_LABEL = '확인된 주입 항목';
-        // WUISyncMemoryEdit 실패 notify는 WLOG.short()를 거쳐 "[기억은 저장됨] <오류>"로 표시된다.
-        const SYNC_FAILED_TOAST_PATTERN = /주입 재적용 대기|^\s*\[기억은 저장됨\]/;
-        const INJECT_RELEASE_SELECTOR = '.m3-inject[data-act="release"]';
-        const INJECT_ARM_SELECTOR = '.m3-inject[data-act="arm"]';
-        const QUICK_ITEM_BIND_PREFIX = 'quick.item:';
-        const QUICK_USER_EXCLUDED_REASON = '이번 세션에서 직접 제외';
-        const DUPLICATE_WINDOW_MS = 2500;
-        const UI_TIMEOUT_MS = 8000;
-        const WRMC_BOOT_WAIT_MS = 3000;
-        // WRMC 저장/토글은 현재 주입(carrier) 재구성을 비동기로 끝낸다. 서버 PATCH·검증까지 기다린다.
-        const SYNC_TIMEOUT_MS = 45000;
-        const INJECTION_WAIT_MS = 30000;
-        const INJECTION_POLL_MS = 400;
-
-        let applyQueue = Promise.resolve();
-        let lastApplyKey = '';
-        let lastApplyAt = 0;
-
-        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-        function runtimeMarker() {
-            return document.documentElement?.getAttribute(RUNTIME_ATTR) || '';
-        }
-
-        /**
-         * WRMC 설치 판정: runtime marker(<html data-wish-rp-runtime>)는 Crack 쪽 렌더로 사라질 수 있어
-         * 진단용으로만 쓴다. 실제 판정은 WRMC가 직접 만드는 UI 두 가지 이상의 조합이다.
-         * - #wish-rp-root (WRMC ensureRoot()가 생성)
-         * - AND 다음 중 하나:
-         *   · root 직속 .wish-dlg-layer[data-key="dl"] + .wish-toast-wrap[data-key="tw"] (WRMC vRoot()가 매 렌더 출력)
-         *   · #wish-rp-monitor .wish-mon-core (채팅방 상태 모니터)
-         *   · 전체 패널 주 메뉴 [data-key="shell-layout"] nav[aria-label="주 메뉴"]
-         */
-        function detectWrmcUi() {
-            const root = document.querySelector(ROOT_SELECTOR);
-            const layers = !!root?.querySelector(':scope > .wish-dlg-layer[data-key="dl"]') &&
-                !!root?.querySelector(':scope > .wish-toast-wrap[data-key="tw"]');
-            const monitor = !!document.querySelector(MONITOR_SELECTOR);
-            const shell = !!root?.querySelector('[data-key="shell-layout"] nav[aria-label="주 메뉴"]');
-            return { root: !!root, layers, monitor, shell, runtime: runtimeMarker() };
-        }
-
-        function isAvailable() {
-            const ui = detectWrmcUi();
-            return ui.root && (ui.layers || ui.monitor || ui.shell);
-        }
-
-        /** WRMC가 아직 부팅 중일 수 있으므로 짧게만 기다린다(무한 대기 없음). */
-        async function waitForWrmcUi() {
-            const deadline = Date.now() + WRMC_BOOT_WAIT_MS;
-            while (!isAvailable()) {
-                if (Date.now() >= deadline) return false;
-                await delay(100);
-            }
-            return true;
-        }
-
-        function getUiState() {
-            const root = document.querySelector(ROOT_SELECTOR);
-            const activeNav = root?.querySelector(
-                '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][aria-current="page"]'
-            );
-            const activeMemorySub = root?.querySelector(
-                'button[data-act="memSub"][aria-selected="true"]'
-            );
-
-            return {
-                runtime: runtimeMarker(),
-                panelOpen: !!document.querySelector(PANEL_SELECTOR),
-                quickOpen: !!document.querySelector(QUICK_SELECTOR),
-                activeNav: activeNav?.dataset.arg || '',
-                activeMemorySub: activeMemorySub?.dataset.arg || '',
-            };
-        }
-
-        function assertChat(chatId, stage) {
-            const currentChatId = parseChatId();
-            if (!currentChatId || String(currentChatId) !== String(chatId)) {
-                throw new Error(`WRMC OOC 적용 중 채팅방이 바뀌어 ${stage}를 중단했습니다.`);
-            }
-        }
-
-        async function waitFor(getValue, description, timeout = UI_TIMEOUT_MS) {
-            const startedAt = Date.now();
-
-            while (Date.now() - startedAt < timeout) {
-                const value = getValue();
-                if (value) return value;
-                await delay(50);
-            }
-
-            throw new Error(`WRMC UI 호환 실패: ${description}을(를) 확인하지 못했습니다.`);
-        }
-
-        function requireUnique(root, selector, description) {
-            const matches = [...root.querySelectorAll(selector)];
-            if (matches.length !== 1) {
-                throw new Error(`WRMC UI 호환 실패: ${description} 요소가 ${matches.length}개입니다.`);
-            }
-            return matches[0];
-        }
-
-        function click(element, description) {
-            if (!element || element.nodeType !== 1 || typeof element.click !== 'function' || element.disabled) {
-                throw new Error(`WRMC UI 호환 실패: ${description}을(를) 실행할 수 없습니다.`);
-            }
-            element.click();
-        }
-
-        function setNativeValue(element, value) {
-            const view = element.ownerDocument?.defaultView || window;
-            const prototype = element.tagName === 'TEXTAREA'
-                ? view.HTMLTextAreaElement?.prototype
-                : view.HTMLInputElement?.prototype;
-            const setter = prototype && Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-            const EventConstructor = view.Event || Event;
-
-            if (!setter) {
-                throw new Error('WRMC UI 호환 실패: 입력값 setter를 확인하지 못했습니다.');
-            }
-
-            setter.call(element, String(value ?? ''));
-            element.dispatchEvent(new EventConstructor('input', { bubbles: true, composed: true }));
-            element.dispatchEvent(new EventConstructor('change', { bubbles: true, composed: true }));
-        }
-
-        async function openExtraView(chatId) {
-            assertChat(chatId, 'WRMC 열기 전');
-
-            if (!document.querySelector(PANEL_SELECTOR)) {
-                let quick = document.querySelector(QUICK_SELECTOR);
-
-                if (!quick) {
-                    const monitor = await waitFor(
-                        () => document.querySelector(MONITOR_SELECTOR),
-                        '상태 모니터'
-                    );
-                    click(monitor, 'WRMC 빠른 패널 열기');
-                    quick = await waitFor(
-                        () => document.querySelector(QUICK_SELECTOR),
-                        '빠른 패널'
-                    );
-                }
-
-                const fullButton = requireUnique(
-                    quick,
-                    'button[data-act="quickFull"]',
-                    '전체 설정 버튼'
-                );
-                click(fullButton, 'WRMC 전체 설정 열기');
-                await waitFor(() => document.querySelector(PANEL_SELECTOR), '전체 패널');
-            }
-
-            assertChat(chatId, 'WRMC 기억 화면 전환 전');
-            const root = document.querySelector(ROOT_SELECTOR);
-            if (!root) throw new Error('WRMC UI 호환 실패: 루트 요소가 없습니다.');
-
-            if (root.querySelector('.wish-dlg-layer > .m3-dialog:not(.m3-leaving)')) {
-                throw new Error('WRMC OOC 자동 적용 보류: WRMC 편집창이 열려 있습니다.');
-            }
-
-            const memoryButton = requireUnique(
-                root,
-                '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="memory"]',
-                '기억 탭 버튼'
-            );
-            click(memoryButton, 'WRMC 기억 탭 열기');
-
-            const extraButton = await waitFor(() => {
-                const buttons = [...root.querySelectorAll('button[data-act="memSub"][data-arg="extra"]')];
-                return buttons.length === 1 ? buttons[0] : null;
-            }, '기타·OOC 탭 버튼');
-            click(extraButton, 'WRMC 기타·OOC 탭 열기');
-
-            return waitFor(() => document.querySelector(EXTRA_VIEW_SELECTOR), '기타·OOC 화면');
-        }
-
-        function findModelOocSlot(extraView) {
-            const cards = [...extraView.querySelectorAll('details.m3-card')].filter(card => {
-                const title = card.querySelector(':scope > summary .m3-t > b');
-                return title?.textContent === WRMC_RESERVED_SLOT_TITLE;
-            });
-
-            if (cards.length > 1) {
-                throw new Error('WRMC OOC 적용 중단: 예약 슬롯이 여러 개입니다.');
-            }
-            if (!cards.length) return null;
-
-            const card = cards[0];
-            const editButton = requireUnique(card, 'button[data-act="xEdit"][data-arg]', '예약 슬롯 편집 버튼');
-            const slotId = editButton.dataset.arg || '';
-            const enableButton = [...card.querySelectorAll('button[data-act="flip"][data-arg]')]
-                .find(button => button.dataset.arg === `extra.enabled:${slotId}`);
-
-            if (!slotId || !enableButton) {
-                throw new Error('WRMC UI 호환 실패: 예약 슬롯 제어를 확인하지 못했습니다.');
-            }
-
-            return {
-                card,
-                editButton,
-                enableButton,
-                slotId,
-                content: card.querySelector(':scope > .m3-cardbody > p')?.textContent ?? '',
-            };
-        }
-
-        async function waitForSlotEditor() {
-            return waitFor(() => {
-                const dialogs = [...document.querySelectorAll(`${ROOT_SELECTOR} .wish-dlg-layer > .m3-dialog`)]
-                    .filter(dialog => (
-                        dialog.querySelector('input[data-bind$=".title"]') &&
-                        dialog.querySelector('textarea[data-bind$=".content"]') &&
-                        dialog.querySelector('button[data-act="eSave"][data-arg]')
-                    ));
-                return dialogs.length === 1 ? dialogs[0] : null;
-            }, '기타·OOC 편집창');
-        }
-
-        function findExtraPolicyButton(extraView) {
-            return requireUnique(
-                extraView,
-                'button[data-act="flip"][data-arg="pol.extra"]',
-                '기타·OOC 그룹 주입 정책(pol.extra) 버튼'
-            );
-        }
-
-        function extraPolicyState(extraView) {
-            return findExtraPolicyButton(extraView).getAttribute('aria-pressed') === 'true';
-        }
-
-        /**
-         * 기타·OOC 그룹 전체 주입 정책(room.injectionPolicy.extraEvery / UI pol.extra)을 공식 칩으로 켠다.
-         * 끄는 일은 하지 않는다: 사용자의 다른 기타·OOC 슬롯도 같은 정책을 공유한다.
-         * WRMC flip은 setKey()의 go()를 await하지 않으므로 여기서는 "요청"만 확인한다.
-         * 저장 완료는 이후 flushWrmcToggleWrites()의 공식 편집 저장이 끝나는 시점으로 판단한다.
-         */
-        async function ensureExtraPolicyEnabled(extraView, chatId, knownToasts) {
-            if (extraPolicyState(extraView)) return { view: extraView, changed: false };
-
-            assertChat(chatId, '기타·OOC 주입 정책 변경 전');
-            click(findExtraPolicyButton(extraView), 'WRMC 기타·OOC 주입 정책 켜기');
-            console.log('[WRMC OOC] policy toggle requested', { chatId, from: false, to: true });
-            const view = await waitFor(() => {
-                const failure = newErrorToast(knownToasts);
-                if (failure) {
-                    throw new Error(`WRMC 기타·OOC 주입 정책 저장 실패: ${String(failure.textContent || '').trim()}`);
-                }
-                const current = document.querySelector(EXTRA_VIEW_SELECTOR);
-                return current && extraPolicyState(current) ? current : null;
-            }, '기타·OOC 주입 정책 ON 표시');
-            return { view, changed: true };
-        }
-
-        async function ensureModelOocSlot(extraView, chatId) {
-            const existing = findModelOocSlot(extraView);
-            if (existing) return { slot: existing, editor: null, created: false };
-
-            assertChat(chatId, '예약 슬롯 생성 전');
-            const addButton = requireUnique(extraView, 'button[data-act="xNew"]', '기타·OOC 추가 버튼');
-            click(addButton, 'WRMC 예약 슬롯 생성');
-            const editor = await waitForSlotEditor();
-            assertChat(chatId, '예약 슬롯 편집 전');
-            return { slot: null, editor, created: true };
-        }
-
-        /** content === null이면 편집창에 WRMC가 불러온 저장본을 그대로 다시 저장한다(write barrier 용). */
-        async function setSlotContent(slotState, content, chatId, force) {
-            if (slotState.slot && !force && slotState.slot.content === content) return slotState.slot;
-
-            let editor = slotState.editor;
-            if (!editor) {
-                assertChat(chatId, '예약 슬롯 편집 전');
-                click(slotState.slot.editButton, 'WRMC 예약 슬롯 편집');
-                editor = await waitForSlotEditor();
-            }
-
-            const titleInput = requireUnique(editor, 'input[data-bind$=".title"]', '예약 슬롯 제목 입력');
-            const contentInput = requireUnique(editor, 'textarea[data-bind$=".content"]', '예약 슬롯 내용 입력');
-            const saveButton = requireUnique(editor, 'button[data-act="eSave"][data-arg]', '예약 슬롯 저장 버튼');
-
-            setNativeValue(titleInput, WRMC_RESERVED_SLOT_TITLE);
-            if (content !== null) setNativeValue(contentInput, content);
-            assertChat(chatId, '예약 슬롯 저장 전');
-            const knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-            click(saveButton, 'WRMC 예약 슬롯 저장');
-            // WRMC 편집창은 saveRoom + 현재 주입 동기화(WUISyncMemoryEdit)가 끝난 뒤에 닫힌다.
-            await waitFor(() => {
-                const failure = newErrorToast(knownToasts);
-                if (failure) throw new Error(`WRMC 저장 실패(토글 또는 예약 슬롯): ${String(failure.textContent || '').trim()}`);
-                return !editor.isConnected;
-            }, '예약 슬롯 저장 완료', SYNC_TIMEOUT_MS);
-
-            const extraView = await waitFor(
-                () => document.querySelector(EXTRA_VIEW_SELECTOR),
-                '저장 후 기타·OOC 화면'
-            );
-            const slot = findModelOocSlot(extraView);
-            if (!slot) throw new Error('WRMC OOC 저장 후 예약 슬롯을 확인하지 못했습니다.');
-            return slot;
-        }
-
-        /**
-         * WRMC flip은 aria-pressed를 먼저 바꾸고 saveRoom → WUISyncMemoryEdit는 await되지 않은 go()에서 끝낸다.
-         * 여기서는 토글 "요청"과 화면 반영만 확인한다. 저장 완료는 flushWrmcToggleWrites()가 보장한다.
-         */
-        async function setSlotEnabled(slot, enabled, chatId) {
-            const current = slot.enableButton.getAttribute('aria-pressed') === 'true';
-            if (current === enabled) return false;
-
-            assertChat(chatId, '예약 슬롯 활성 상태 변경 전');
-            click(slot.enableButton, 'WRMC 예약 슬롯 활성 상태 변경');
-            console.log('[WRMC OOC] slot enabled toggle requested', { chatId, slotId: slot.slotId, from: current, to: enabled });
-            await waitFor(() => {
-                const view = document.querySelector(EXTRA_VIEW_SELECTOR);
-                const refreshed = view ? findModelOocSlot(view) : null;
-                return refreshed?.enableButton.getAttribute('aria-pressed') === String(enabled);
-            }, '예약 슬롯 활성 상태 표시');
-            assertChat(chatId, '예약 슬롯 활성 상태 변경 후');
-            return true;
-        }
-
-        /**
-         * WRMC 토글 저장 flush barrier.
-         * 공식 xEdit → eSave 편집 저장은 saveRoom()과 WUISyncMemoryEdit()를 await한 뒤 편집창을 닫는다.
-         * saveRoom()은 같은 방의 쓰기를 storageWrites 체인으로 직렬화하고, carrier sync도 withCarrierOperation
-         * 체인으로 직렬화하므로, 이 저장이 끝났다면 앞서 시작된 pol.extra / extra.enabled 토글의
-         * saveRoom()과 주입 sync도 이미 끝난 상태다. 본문이 같아도 반드시 저장한다(force).
-         * content === null이면 편집창의 저장본을 그대로 저장한다(OFF 프리셋에서 본문을 건드리지 않기 위해).
-         */
-        async function flushWrmcToggleWrites(content, chatId) {
-            console.log('[WRMC OOC] write barrier start', { chatId });
-            const extraView = await openExtraView(chatId);
-            const slot = findModelOocSlot(extraView);
-            if (!slot) {
-                throw new Error('WRMC 토글 저장 확인 전에 모델별 OOC 예약 슬롯을 찾지 못했습니다.');
-            }
-            const saved = await setSlotContent({ slot, editor: null, created: false }, content, chatId, true);
-            console.log('[WRMC OOC] write barrier completed', { chatId, slotId: saved.slotId });
-            return saved;
-        }
-
-        /** barrier 뒤 기타·OOC 화면을 새로 열어 room 상태에서 다시 그린 UI로 최종 상태를 확인한다. */
-        async function readPostBarrierState(chatId) {
-            const extraView = await openExtraView(chatId);
-            const slot = findModelOocSlot(extraView);
-            return {
-                slot,
-                policy: extraPolicyState(extraView),
-                slotEnabled: slot ? slot.enableButton.getAttribute('aria-pressed') === 'true' : false,
-                content: slot ? slot.content : null,
-            };
-        }
-
-        function isInjectionActive() {
-            const root = document.querySelector(ROOT_SELECTOR);
-            return !!root?.querySelector(INJECT_RELEASE_SELECTOR);
-        }
-
-        async function openInjectionView(chatId) {
-            assertChat(chatId, '현재 주입 확인 전');
-            const root = document.querySelector(ROOT_SELECTOR);
-            if (!root) throw new Error('WRMC UI 호환 실패: 루트 요소가 없습니다.');
-
-            const checkButton = requireUnique(
-                root,
-                '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="check"]',
-                '주입확인 탭 버튼'
-            );
-            click(checkButton, 'WRMC 주입확인 탭 열기');
-            return waitFor(() => document.querySelector(INJECTION_VIEW_SELECTOR), '주입확인 화면');
-        }
-
-        function findInjectionRows(injectionView) {
-            return [...injectionView.querySelectorAll('.m3-irow')].filter(row => (
-                row.querySelector('.m3-t > b')?.textContent === WRMC_RESERVED_SLOT_TITLE
-            ));
-        }
-
-        function readInjectionPanel(injectionView) {
-            const rows = findInjectionRows(injectionView);
-            return {
-                rows,
-                activeRows: rows.filter(row => !row.classList.contains('is-off')),
-                totalRows: injectionView.querySelectorAll('.m3-irow').length,
-                // WRMC는 현재 구성이 저장된 carrier와 같고 서버 검증까지 끝났을 때만 이 제목을 쓴다.
-                verified: injectionView.querySelector(':scope > .m3-row > b')?.textContent === VERIFIED_INJECTION_LABEL,
-            };
-        }
-
-        // WRMC contextItemSection()/safeForHtmlComment()와 같은 규칙으로 기대 섹션을 만든다.
-        const ZERO_WIDTH_SPACE = String.fromCharCode(0x200B);
-        function commentSafe(text) {
-            return String(text || '').replace(/<!--/g, '<' + ZERO_WIDTH_SPACE + '!--').replace(/-->/g, '--' + ZERO_WIDTH_SPACE + '>');
-        }
-
-        function reservedSectionHeading() {
-            return `### ${commentSafe(WRMC_RESERVED_SLOT_TITLE)}\n`;
-        }
-
-        function expectedReservedSection(content) {
-            return reservedSectionHeading() + commentSafe(String(content || '').trim());
-        }
-
-        function previewCardTitle(card) {
-            const title = card.querySelector(':scope > summary .m3-t > b');
-            if (!title) return '';
-            const prefix = title.querySelector('.m3-pvn')?.textContent || '';
-            const text = title.textContent || '';
-            return prefix && text.startsWith(prefix) ? text.slice(prefix.length) : text;
-        }
-
-        function openDialogs() {
-            return [...document.querySelectorAll(`${ROOT_SELECTOR} .wish-dlg-layer > .m3-dialog:not(.m3-leaving)`)];
-        }
-
-        async function closeDialog(dialog, description) {
-            if (!dialog.isConnected) return;
-            // WRMC 시트는 헤더 아이콘과 푸터에 같은 closeDlg 버튼을 둔다.
-            const dialogId = dialog.dataset?.dlg || '';
-            const closeButton = [...dialog.querySelectorAll('button[data-act="closeDlg"][data-arg]')]
-                .find(button => !dialogId || button.dataset.arg === dialogId);
-            click(closeButton, `WRMC ${description} 닫기`);
-            await waitFor(() => !dialog.isConnected, `${description} 닫힘`);
-        }
-
-        /**
-         * WRMC 주입 미리보기(카드별 원문)와 그 안의 [전체 원문] 뷰어를 공식 UI로 열어 읽는다.
-         * 전체 원문은 WRMC가 실제 carrier에 넣는 context block과 같은 formatter 결과다.
-         */
-        async function readInjectionPreview(chatId) {
-            assertChat(chatId, '현재 주입 원문 확인 전');
-            const root = document.querySelector(ROOT_SELECTOR);
-            const previewButton = requireUnique(root, 'button[data-act="preview"]', '주입 미리보기 버튼');
-            click(previewButton, 'WRMC 주입 미리보기 열기');
-
-            const dialog = await waitFor(
-                () => openDialogs().find(item => item.querySelector('button[data-act="viewer"]')) || null,
-                '주입 미리보기'
-            );
-
-            try {
-                const allCards = [...dialog.querySelectorAll('details.m3-card[data-key^="k-pv-"]')];
-                const cardTitles = allCards.map(previewCardTitle);
-                const cards = allCards.filter(card => previewCardTitle(card) === WRMC_RESERVED_SLOT_TITLE);
-                if (cards.length > 1) {
-                    throw new Error('WRMC OOC 적용 중단: 현재 주입에 예약 슬롯이 여러 개입니다.');
-                }
-                const cardContent = cards[0]?.querySelector(':scope > .m3-cardbody pre.m3-block')?.textContent ?? null;
-
-                click(requireUnique(dialog, 'button[data-act="viewer"]', '전체 원문 버튼'), 'WRMC 주입 전체 원문 열기');
-                const viewer = await waitFor(
-                    () => openDialogs().find(item => item !== dialog && item.querySelector('pre.m3-block.tall')) || null,
-                    '주입 전체 원문'
-                );
-                try {
-                    const fullText = viewer.querySelector('pre.m3-block.tall')?.textContent ?? '';
-                    return { cardContent, fullText, cardTitles };
-                } finally {
-                    await closeDialog(viewer, '주입 전체 원문');
-                }
-            } finally {
-                await closeDialog(dialog, '주입 미리보기');
-            }
-        }
-
-        function newSyncFailureToast(knownToasts) {
-            return [...document.querySelectorAll(TOAST_SELECTOR)].some(toast => (
-                !knownToasts.has(toast) && SYNC_FAILED_TOAST_PATTERN.test(String(toast.textContent || ''))
-            ));
-        }
-
-        function judgeInjection(preview, content, enabled) {
-            if (!enabled) return !preview.fullText.includes(reservedSectionHeading());
-            return preview.cardContent === String(content || '').trim() &&
-                preview.fullText.includes(expectedReservedSection(content));
-        }
-
-        /**
-         * WRMC 토글/저장은 화면 상태를 먼저 바꾸고 현재 주입 재구성(reconcileStableCarrier)은
-         * 서버 PATCH·검증 뒤에 끝난다. 주입확인 화면을 다시 그리며 그 완료를 기다린 뒤,
-         * 주입 미리보기 카드와 전체 원문에 예약 슬롯 제목·본문이 실제로 있는지 확인한다.
-         */
-        async function verifyCurrentInjection(content, enabled, chatId, knownToasts = new Set()) {
-            const inactive = { active: false, reflected: true, quickExcluded: false, carrierVerified: false };
-            if (!isInjectionActive()) return inactive;
-
-            const deadline = Date.now() + INJECTION_WAIT_MS;
-            while (true) {
-                assertChat(chatId, '현재 주입 반영 확인 중');
-                if (!isInjectionActive()) return inactive;
-
-                // 주입확인 탭을 다시 누르면 WRMC가 최신 pending으로 화면을 다시 그린다.
-                const panel = readInjectionPanel(await openInjectionView(chatId));
-                if (
-                    enabled &&
-                    !panel.activeRows.length &&
-                    panel.rows.length === 1 &&
-                    panel.rows[0].classList.contains('why-me')
-                ) {
-                    return { active: true, reflected: true, quickExcluded: true, carrierVerified: panel.verified };
-                }
-
-                const rowsReady = enabled
-                    ? panel.activeRows.length === 1 && panel.rows.length === 1
-                    : !panel.activeRows.length;
-                const settled = rowsReady && (panel.verified || (!enabled && !panel.totalRows));
-                const timedOut = Date.now() >= deadline;
-                const syncFailed = newSyncFailureToast(knownToasts);
-                // 예약 슬롯이 현재 주입 세션에 들어 있는지(본문만 이전 값인지)를 fallback 선택에 쓴다.
-                const reservedActive = panel.activeRows.length > 0;
-
-                if (settled || timedOut || syncFailed) {
-                    // 진단 전용 필드: 결정에는 쓰지 않는다.
-                    const diagnostics = { rowFound: panel.rows.length > 0, previewCardFound: null, fullTextFound: null, cardTitles: null };
-                    if (!rowsReady) {
-                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false, reservedActive, ...diagnostics };
-                    }
-                    const preview = await readInjectionPreview(chatId);
-                    return {
-                        active: true,
-                        reflected: judgeInjection(preview, content, enabled),
-                        quickExcluded: false,
-                        carrierVerified: settled,
-                        reservedActive,
-                        ...diagnostics,
-                        previewCardFound: preview.cardContent !== null,
-                        fullTextFound: preview.fullText.includes(reservedSectionHeading()),
-                        cardTitles: preview.cardTitles,
-                    };
-                }
-                await delay(INJECTION_POLL_MS);
-            }
-        }
-
-        async function refreshCurrentInjectionViaSlotSave(content, chatId) {
-            const extraView = await openExtraView(chatId);
-            const slot = findModelOocSlot(extraView);
-            if (!slot) throw new Error('WRMC 현재 주입 갱신 전 예약 슬롯을 확인하지 못했습니다.');
-            return setSlotContent({ slot, editor: null, created: false }, content, chatId, true);
-        }
-
-        function injectButton(selector) {
-            const root = document.querySelector(ROOT_SELECTOR);
-            const buttons = root ? [...root.querySelectorAll(selector)] : [];
-            if (buttons.length > 1) {
-                throw new Error(`WRMC UI 호환 실패: 주입 버튼(${selector}) 요소가 ${buttons.length}개입니다.`);
-            }
-            return buttons[0] || null;
-        }
-
-        function newErrorToast(knownToasts) {
-            return [...document.querySelectorAll(TOAST_SELECTOR)]
-                .find(toast => !knownToasts.has(toast) && toast.classList.contains('error')) || null;
-        }
-
-        /** WRMC footer 버튼이 원하는 상태(release/arm)로 바뀌고 작업 중(disabled)이 끝날 때까지 기다린다. */
-        function waitForInjectButton(selector, description, knownToasts) {
-            return waitFor(() => {
-                const failure = newErrorToast(knownToasts);
-                if (failure) {
-                    throw new Error(`${description} 실패: ${String(failure.textContent || '').trim()}`);
-                }
-                const button = injectButton(selector);
-                return button && !button.disabled ? button : null;
-            }, description, SYNC_TIMEOUT_MS);
-        }
-
-        async function withQuickPanel(chatId, work) {
-            assertChat(chatId, 'WRMC 빠른 패널 열기 전');
-            const wasOpen = !!document.querySelector(QUICK_SELECTOR);
-            if (!wasOpen) {
-                const monitor = await waitFor(() => document.querySelector(MONITOR_SELECTOR), '상태 모니터');
-                click(monitor, 'WRMC 빠른 패널 열기');
-            }
-            await waitFor(() => document.querySelector(QUICK_SELECTOR), '빠른 패널');
-            try {
-                return await work();
-            } finally {
-                const quick = document.querySelector(QUICK_SELECTOR);
-                if (!wasOpen && quick) {
-                    click(requireUnique(quick, 'button[data-act="quickClose"]', '빠른 패널 닫기 버튼'), 'WRMC 빠른 패널 닫기');
-                    await waitFor(() => !document.querySelector(QUICK_SELECTOR), '빠른 패널 닫힘');
-                }
-            }
-        }
-
-        /** 빠른 패널의 일반 항목 체크박스. key는 WRMC pendingItemIdentity()와 같은 identity다. */
-        function readQuickItems() {
-            const quick = document.querySelector(QUICK_SELECTOR);
-            if (!quick) return [];
-            return [...quick.querySelectorAll('label.wq-row')].map(row => {
-                const input = row.querySelector('input[type="checkbox"][data-bind]');
-                const bind = input?.getAttribute('data-bind') || '';
-                if (!bind.startsWith(QUICK_ITEM_BIND_PREFIX)) return null;
-                const reason = String(row.querySelector('.m3-t > small')?.textContent || '');
-                return {
-                    key: bind.slice(QUICK_ITEM_BIND_PREFIX.length),
-                    title: row.querySelector('.m3-t > b')?.textContent || '',
-                    input,
-                    checked: !!input.checked,
-                    userExcluded: !input.checked && reason.startsWith(QUICK_USER_EXCLUDED_REASON),
-                };
-            }).filter(item => item && item.key);
-        }
-
-        /** 재시작 전에 이번 세션에서 사용자가 빠른 패널로 직접 끈 항목의 identity만 모은다. */
-        async function captureQuickExclusions(chatId, reservedKey) {
-            return withQuickPanel(chatId, async () => {
-                const seen = new Set();
-                return readQuickItems()
-                    .filter(item => item.userExcluded && item.key !== reservedKey)
-                    .filter(item => !seen.has(item.key) && seen.add(item.key))
-                    .map(item => ({ key: item.key, title: item.title }));
-            });
-        }
-
-        /** 새 세션의 빠른 패널에서 identity가 정확히 같은 항목만 공식 체크박스로 다시 끈다. */
-        async function restoreQuickExclusions(chatId, preserved) {
-            const result = { restored: [], alreadyOff: [], lost: [], unconfirmed: [] };
-            if (!preserved.length) return result;
-
-            await withQuickPanel(chatId, async () => {
-                for (const item of preserved) {
-                    assertChat(chatId, '빠른 제외 복원 중');
-                    const match = readQuickItems().find(row => row.key === item.key);
-                    if (!match) {
-                        result.lost.push(item);
-                    } else if (!match.checked) {
-                        result.alreadyOff.push(item);
-                    } else if (match.input.disabled) {
-                        result.lost.push(item);
-                    } else {
-                        click(match.input, 'WRMC 빠른 제외 복원');
-                        result.restored.push(item);
-                    }
-                }
-                if (!result.restored.length) return;
-                try {
-                    await waitFor(() => {
-                        const rows = readQuickItems();
-                        return result.restored.every(item => rows.some(row => row.key === item.key && row.userExcluded));
-                    }, '빠른 제외 복원 반영', SYNC_TIMEOUT_MS);
-                } catch {
-                    const rows = readQuickItems();
-                    result.unconfirmed = result.restored
-                        .filter(item => !rows.some(row => row.key === item.key && row.userExcluded));
-                }
-            });
-
-            if (result.lost.length || result.unconfirmed.length) {
-                console.warn('[모델별 프리셋/WRMC] 주입 재시작 후 일부 빠른 제외를 보존하지 못했습니다.', {
-                    lost: result.lost,
-                    unconfirmed: result.unconfirmed,
-                });
-            }
-            return result;
-        }
-
-        /**
-         * 현재 pending에 예약 OOC가 없어서(또는 꺼졌는데 남아 있어서) WRMC 저장·토글 sync로 고칠 수 없을 때만,
-         * WRMC footer의 공식 [주입 해제] → [주입 시작] 버튼으로 새 주입 snapshot을 만든다.
-         */
-        async function restartInjectionForReservedSlot(chatId, reservedKey, { allowArmFailure = false } = {}) {
-            assertChat(chatId, '주입 재시작 전');
-            const preserved = await captureQuickExclusions(chatId, reservedKey);
-            console.log('[모델별 프리셋/WRMC] 예약 OOC 반영을 위해 WRMC 주입을 재시작합니다.', {
-                chatId,
-                preservedQuickExclusions: preserved.length,
-                note: '인지 개별 선택(이번 턴만)은 자동 선택과 구분되지 않아 재시작 후 WRMC 기본값을 사용합니다.',
-            });
-
-            assertChat(chatId, '주입 해제 전');
-            let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-            const releaseButton = await waitForInjectButton(INJECT_RELEASE_SELECTOR, 'WRMC 주입 해제 준비', knownToasts);
-            click(releaseButton, 'WRMC 주입 해제');
-            await waitForInjectButton(INJECT_ARM_SELECTOR, 'WRMC 주입 해제', knownToasts);
-
-            assertChat(chatId, '주입 시작 전');
-            knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-            const armButton = injectButton(INJECT_ARM_SELECTOR);
-            click(armButton, 'WRMC 주입 시작');
-            try {
-                await waitForInjectButton(INJECT_RELEASE_SELECTOR, 'WRMC 주입 시작', knownToasts);
-            } catch (error) {
-                if (allowArmFailure) {
-                    console.warn('[모델별 프리셋/WRMC] 예약 OOC 제거 후 주입할 항목이 없어 WRMC 주입이 꺼진 상태입니다.', error);
-                    return { armed: false, preserved };
-                }
-                throw new Error(`${error.message} · WRMC 주입이 해제된 상태입니다. WRMC에서 [주입 시작]을 직접 눌러 주세요.`);
-            }
-            assertChat(chatId, '주입 시작 후');
-            return { armed: true, preserved };
-        }
-
-        async function restoreUiState(initialState) {
-            const root = document.querySelector(ROOT_SELECTOR);
-
-            if (initialState.panelOpen && document.querySelector(PANEL_SELECTOR) && root) {
-                if (initialState.activeNav === 'memory') {
-                    const memoryButton = requireUnique(
-                        root,
-                        '[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="memory"]',
-                        '기억 탭 복원 버튼'
-                    );
-                    click(memoryButton, 'WRMC 기억 탭 복원');
-                    if (initialState.activeMemorySub) {
-                        const subButton = await waitFor(() => {
-                            const buttons = [...root.querySelectorAll(
-                                `button[data-act="memSub"][data-arg="${initialState.activeMemorySub}"]`
-                            )];
-                            return buttons.length === 1 ? buttons[0] : null;
-                        }, '기억 하위 탭 복원 버튼');
-                        click(subButton, 'WRMC 기억 하위 탭 복원');
-                    }
-                } else if (initialState.activeNav && initialState.activeNav !== 'memory') {
-                    const navButton = requireUnique(
-                        root,
-                        `[data-key="shell-layout"] nav[aria-label="주 메뉴"] button[data-act="nav"][data-arg="${initialState.activeNav}"]`,
-                        '기존 탭 복원 버튼'
-                    );
-                    click(navButton, 'WRMC 기존 탭 복원');
-                }
-            }
-
-            if (!initialState.panelOpen && document.querySelector(PANEL_SELECTOR) && root) {
-                const closeButton = requireUnique(root, 'button[data-act="closePanel"]', '전체 패널 닫기 버튼');
-                click(closeButton, 'WRMC 전체 패널 닫기');
-                await waitFor(() => !document.querySelector(PANEL_SELECTOR), '전체 패널 닫힘');
-            }
-
-            if (initialState.quickOpen && !document.querySelector(QUICK_SELECTOR)) {
-                const monitor = document.querySelector(MONITOR_SELECTOR);
-                if (monitor) {
-                    click(monitor, 'WRMC 빠른 패널 복원');
-                    await waitFor(() => document.querySelector(QUICK_SELECTOR), '빠른 패널 복원');
-                }
-            } else if (!initialState.quickOpen && document.querySelector(QUICK_SELECTOR)) {
-                const quick = document.querySelector(QUICK_SELECTOR);
-                const closeButton = quick && requireUnique(quick, 'button[data-act="quickClose"]', '빠른 패널 닫기 버튼');
-                if (closeButton) click(closeButton, 'WRMC 빠른 패널 닫기');
-            }
-        }
-
-        function logInjectionVerify(label, injection) {
-            console.log(`[WRMC OOC] ${label}`, {
-                active: injection.active,
-                reflected: injection.reflected,
-                rowFound: injection.rowFound ?? null,
-                previewCardFound: injection.previewCardFound ?? null,
-                fullTextFound: injection.fullTextFound ?? null,
-                carrierVerified: injection.carrierVerified,
-                quickExcluded: injection.quickExcluded,
-            });
-        }
-
-        /** 실패 시 원인 판별용 상태를 공식 UI에서 다시 읽어 console에 남긴다. 추측 수정은 하지 않는다. */
-        async function reportInjectionFailure(chatId, injection) {
-            const report = {
-                reservedSlotId: null,
-                reservedSlotTitle: null,
-                reservedSlotVisibleContent: null,
-                policyExtra: null,
-                slotEnabled: null,
-                injectionActive: isInjectionActive(),
-                injectionRowFound: injection?.rowFound ?? null,
-                previewCardTitles: injection?.cardTitles ?? null,
-                fullTextHasReservedTitle: injection?.fullTextFound ?? null,
-            };
-            try {
-                const state = await readPostBarrierState(chatId);
-                report.reservedSlotId = state.slot?.slotId ?? null;
-                report.reservedSlotTitle = state.slot ? WRMC_RESERVED_SLOT_TITLE : null;
-                report.reservedSlotVisibleContent = state.content;
-                report.policyExtra = state.policy;
-                report.slotEnabled = state.slotEnabled;
-                report.injectionActive = isInjectionActive();
-                if (report.injectionActive) {
-                    report.injectionRowFound = readInjectionPanel(await openInjectionView(chatId)).rows.length > 0;
-                    const preview = await readInjectionPreview(chatId);
-                    report.previewCardTitles = preview.cardTitles;
-                    report.fullTextHasReservedTitle = preview.fullText.includes(reservedSectionHeading());
-                }
-            } catch (error) {
-                report.diagnosticError = String(error?.message || error);
-            }
-            console.error('[WRMC OOC] failure diagnostics', report);
-            return report;
-        }
-
-        async function applyInternal(request) {
-            const available = await waitForWrmcUi();
-            console.log('[WRMC OOC] isAvailable=' + available, detectWrmcUi());
-            if (!available) return { applied: false, reason: 'not-installed' };
-
-            const initialState = getUiState();
-            const content = String(request.content || '');
-            const enabled = !!request.enabled && !!content.trim();
-
-            try {
-                assertChat(request.chatId, 'WRMC OOC 적용 직전');
-                // 토글/저장 중 WRMC가 띄우는 오류·경고 토스트를 구분하기 위한 기준점.
-                const toggleToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-                let extraView = await openExtraView(request.chatId);
-
-                // 1. 그룹 정책(pol.extra): 예약 슬롯만 켜도 OFF면 WRMC가 기타·OOC 전체를 주입하지 않는다.
-                let policyChanged = false;
-                if (enabled) {
-                    const policy = await ensureExtraPolicyEnabled(extraView, request.chatId, toggleToasts);
-                    extraView = policy.view;
-                    policyChanged = policy.changed;
-                }
-
-                // 2. 예약 슬롯 생성/본문 저장 (공식 편집 저장 — editor가 닫힐 때까지 await)
-                let slotState = await ensureModelOocSlot(extraView, request.chatId);
-                if (slotState.created || enabled) {
-                    slotState = {
-                        slot: await setSlotContent(slotState, content, request.chatId, !!request.force),
-                        editor: null,
-                        created: slotState.created,
-                    };
-                }
-
-                // 3. 예약 슬롯 extra.enabled 토글 요청 (WRMC flip은 저장 완료를 반환하지 않음)
-                assertChat(request.chatId, '예약 슬롯 최종 적용 전');
-                const enabledChanged = await setSlotEnabled(slotState.slot, enabled, request.chatId);
-
-                // 4~5. 토글 저장 flush barrier: 공식 편집 저장이 끝나야 앞선 토글의 saveRoom/sync도 끝난 것이다.
-                if (policyChanged || enabledChanged) {
-                    await flushWrmcToggleWrites(enabled ? content : null, request.chatId);
-                    const toggleFailure = newErrorToast(toggleToasts);
-                    if (toggleFailure) {
-                        throw new Error(`WRMC 토글 저장 실패: ${String(toggleFailure.textContent || '').trim()}`);
-                    }
-                }
-
-                // 6. 기타·OOC 화면을 새로 열어 room 상태로 다시 그린 최종 UI를 재검증한다.
-                const postState = await readPostBarrierState(request.chatId);
-                console.log('[WRMC OOC] post-barrier state:', {
-                    policy: postState.policy,
-                    slotEnabled: postState.slotEnabled,
-                    contentLength: postState.content === null ? null : countChars(postState.content),
-                    barrier: policyChanged || enabledChanged,
-                });
-                const stateProblem = !postState.slot
-                    ? '예약 슬롯 없음'
-                    : enabled && !postState.policy
-                        ? 'pol.extra OFF'
-                        : postState.slotEnabled !== enabled
-                            ? `extra.enabled=${postState.slotEnabled}`
-                            : enabled && postState.content !== content
-                                ? '예약 슬롯 본문 불일치'
-                                : '';
-                if (stateProblem) {
-                    const diagnostics = await reportInjectionFailure(request.chatId, null);
-                    const error = new Error(`WRMC 저장 후 상태 확인 실패(${stateProblem}). 주입 검증/재시작을 진행하지 않았습니다.`);
-                    error.diagnostics = diagnostics;
-                    throw error;
-                }
-                slotState = { ...slotState, slot: postState.slot };
-
-                // 7. 현재 주입 검증
-                let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-                let injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
-                logInjectionVerify('injection verify result:', injection);
-                if (injection.active && !injection.reflected && enabled && injection.reservedActive) {
-                    // 예약 슬롯은 현재 주입에 있고 본문만 이전 값: 공식 편집 저장 sync를 한 번만 다시 쓴다.
-                    knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-                    await refreshCurrentInjectionViaSlotSave(content, request.chatId);
-                    injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
-                    logInjectionVerify('injection verify result (after re-save):', injection);
-                }
-
-                // 8~9. barrier 이후에만 release → arm fallback
-                let restart = null;
-                let quickRestore = null;
-                const restartRequired = injection.active && !injection.reflected;
-                console.log('[WRMC OOC] restart required=' + restartRequired, { chatId: request.chatId });
-                if (restartRequired) {
-                    // 예약 슬롯이 현재 주입 세션에 없거나(enabled), 꺼졌는데 남아 있음(disabled):
-                    // 저장·토글 sync로는 고쳐지지 않으므로 공식 [주입 해제] → [주입 시작]으로 새 snapshot을 만든다.
-                    restart = await restartInjectionForReservedSlot(
-                        request.chatId,
-                        `slot:${slotState.slot.slotId}`,
-                        { allowArmFailure: !enabled }
-                    );
-                    injection = restart.armed
-                        ? await verifyCurrentInjection(content, enabled, request.chatId)
-                        : { active: false, reflected: true, quickExcluded: false, carrierVerified: false };
-                    console.log('[WRMC OOC] post-restart verify=' + (injection.active ? injection.reflected : 'inactive'), {
-                        armed: restart.armed,
-                        rowFound: injection.rowFound,
-                        previewCardFound: injection.previewCardFound,
-                        fullTextFound: injection.fullTextFound,
-                    });
-                    if (injection.active && injection.reflected && restart.preserved.length) {
-                        quickRestore = await restoreQuickExclusions(request.chatId, restart.preserved);
-                        if (quickRestore.restored.length) {
-                            injection = await verifyCurrentInjection(content, enabled, request.chatId);
-                        }
-                    }
-                    if (enabled && !injection.active) {
-                        throw new Error('WRMC 주입 재시작 후 주입이 활성화되지 않았습니다. WRMC에서 [주입 시작]을 직접 눌러 주세요.');
-                    }
-                }
-                if (injection.active && !injection.reflected) {
-                    const diagnostics = await reportInjectionFailure(request.chatId, injection);
-                    const error = new Error(enabled
-                        ? 'WRMC OOC 저장은 완료했지만 주입확인에 예약 OOC 제목·본문이 나타나지 않았습니다.'
-                        : 'WRMC OOC 주입 OFF는 저장했지만 주입확인에서 예약 OOC가 제거되지 않았습니다.');
-                    error.diagnostics = diagnostics;
-                    throw error;
-                }
-
-                const message = !injection.active
-                    ? (enabled
-                        ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 다음 주입 시작 시 포함'
-                        : restart
-                            ? '[모델별 프리셋/WRMC] OOC 주입 OFF · 남은 주입 항목이 없어 WRMC 주입 꺼짐'
-                            : '[모델별 프리셋/WRMC] OOC 저장 완료 · 주입 OFF')
-                    : injection.quickExcluded
-                        ? '[모델별 프리셋/WRMC] OOC 저장 완료 · 현재 주입의 사용자 제외 유지'
-                        : injection.carrierVerified
-                            ? '[모델별 프리셋/WRMC] 모델별 OOC 적용 및 현재 주입 반영 완료'
-                            : '[모델별 프리셋/WRMC] 모델별 OOC 주입확인 반영 · WRMC 서버 저장 확인 대기';
-                console.log(message, {
-                    chatId: request.chatId,
-                    mode: request.mode,
-                    enabled,
-                    length: countChars(content),
-                    runtime: initialState.runtime,
-                    extraPolicyChanged: policyChanged,
-                    injectionRestarted: !!restart,
-                    quickRestore,
-                });
-                return {
-                    applied: true,
-                    enabled,
-                    injectionActive: injection.active,
-                    injectionReflected: injection.reflected,
-                    carrierVerified: injection.carrierVerified,
-                    quickExcluded: injection.quickExcluded,
-                    extraPolicyChanged: policyChanged,
-                    injectionRestarted: !!restart,
-                    quickRestore,
-                };
-            } finally {
-                try {
-                    await restoreUiState(initialState);
-                } catch (restoreError) {
-                    console.warn('[모델별 프리셋/WRMC] UI 상태 복원 실패', restoreError);
-                }
-            }
-        }
-
-        function applyPreset(request) {
-            const normalized = {
-                chatId: String(request?.chatId || ''),
-                mode: String(request?.mode || ''),
-                content: String(request?.content || ''),
-                enabled: !!request?.enabled,
-                force: !!request?.force,
-            };
-
-            if (!normalized.chatId || !normalized.mode) return Promise.resolve({ applied: false, reason: 'invalid' });
-
-            const applyKey = JSON.stringify([
-                normalized.chatId,
-                normalized.mode,
-                normalized.content,
-                normalized.enabled,
-            ]);
-            const now = Date.now();
-
-            if (!normalized.force && applyKey === lastApplyKey && now - lastApplyAt < DUPLICATE_WINDOW_MS) {
-                return Promise.resolve({ applied: false, reason: 'duplicate' });
-            }
-
-            lastApplyKey = applyKey;
-            lastApplyAt = now;
-            const task = applyQueue.catch(() => {}).then(() => applyInternal(normalized));
-            applyQueue = task;
-            return task;
-        }
-
-        return {
-            isAvailable,
-            getUiState,
-            findModelOocSlot,
-            ensureModelOocSlot,
-            setSlotContent,
-            setSlotEnabled,
-            verifyCurrentInjection,
-            applyPreset,
-        };
-    })();
-
-    function getModePreset(notes, modeKey) {
-        if (!CHAT_MODES.some(mode => mode.key === modeKey)) return null;
-        return normalizeModePreset(notes?.[modeKey]);
-    }
-
     function getModeNotes() {
         const saved = GM_getValue(getModeNotesKey(), null);
-        const notes = saved && typeof saved === 'object' ? { ...saved } : {};
+        const notes = {};
 
         CHAT_MODES.forEach(mode => {
-            notes[mode.key] = normalizeModePreset(saved?.[mode.key]);
+            notes[mode.key] = {
+                content: '',
+                isExtend: false,
+                updatedAt: null,
+            };
         });
 
-        GM_setValue(getModeNotesKey(), notes);
+        if (saved && typeof saved === 'object') {
+            CHAT_MODES.forEach(mode => {
+                notes[mode.key] = {
+                    content: typeof saved?.[mode.key]?.content === 'string'
+                        ? saved[mode.key].content
+                        : '',
+                    isExtend: !!saved?.[mode.key]?.isExtend,
+                    updatedAt: saved?.[mode.key]?.updatedAt || null,
+                };
+            });
+        }
+
+        if (!saved || typeof saved !== 'object') {
+            GM_setValue(getModeNotesKey(), notes);
+        }
         return notes;
     }
 
     function setModeNotes(notes) {
         GM_setValue(getModeNotesKey(), notes);
-    }
-
-    function getPanelOpen() {
-        return GM_getValue(PANEL_OPEN_KEY, false);
-    }
-
-    function setPanelOpen(value) {
-        GM_setValue(PANEL_OPEN_KEY, !!value);
     }
 
     function escapeHtml(str) {
@@ -1138,28 +119,8 @@
             .replaceAll("'", '&#039;');
     }
 
-    function formatTime(ts) {
-        if (!ts) return '저장되지 않았습니다.';
-
-        try {
-            return new Date(ts).toLocaleString();
-        } catch {
-            return '시간 표시 중 오류가 발생했습니다.';
-        }
-    }
-
     function countChars(text) {
         return [...String(text || '')].length;
-    }
-
-    function previewText(text, maxLen = 120) {
-        if (!text) return '(비어 있습니다)';
-
-        const normalized = text.replace(/\s+/g, ' ').trim();
-
-        return countChars(normalized) > maxLen
-            ? [...normalized].slice(0, maxLen).join('') + '…'
-            : normalized;
     }
 
     function getCookie(name) {
@@ -1295,8 +256,8 @@
 
         if (!chatId) return '';
 
-        if (lastDetectedChatId === chatId && lastDetectedChatMode) {
-            return lastDetectedChatMode;
+        if (lastDetectedChatId === chatId && lastDetectedModeKey) {
+            return lastDetectedModeKey;
         }
 
         if (
@@ -1313,11 +274,6 @@
         }
 
         return '';
-    }
-
-    function rememberDetectedChatMode(chatId, modeKey) {
-        lastDetectedChatId = chatId || '';
-        lastDetectedChatMode = modeKey || '';
     }
 
     function getPendingPatchMode(chatId, patchedUserNote) {
@@ -1415,6 +371,8 @@
             textarea.value = value;
         }
 
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
         setTimeout(() => {
             suppressDraftCapture = false;
         }, 0);
@@ -1508,11 +466,59 @@
         return !!lastAppliedUserNoteIsExtend;
     }
 
+    function getPresetDraftKey(chatId, modeKey) {
+        return `${chatId}:${modeKey}`;
+    }
+
+    function updateEditorSessionFromTextarea(textarea, markDirty = true) {
+        const chatId = parseChatId();
+        if (!textarea || !chatId || editorSession?.chatId !== chatId) return;
+
+        editorSession.content = textarea.value || '';
+        editorSession.isExtend = getVisibleUserNoteExtendState(textarea);
+        if (markDirty) editorSession.dirty = true;
+
+        if (editorSession.kind === 'preset' && editorSession.modeKey) {
+            presetEditorDrafts.set(getPresetDraftKey(chatId, editorSession.modeKey), {
+                content: editorSession.content,
+                isExtend: editorSession.isExtend,
+                dirty: !!editorSession.dirty,
+            });
+        } else if (editorSession.kind === 'current' && editorSession.dirty) {
+            currentEditorDraft = {
+                chatId,
+                content: editorSession.content,
+                isExtend: editorSession.isExtend,
+                dirty: true,
+            };
+        }
+
+        renderModeSlots();
+    }
+
     function captureEditingUserNoteDraft(textarea) {
         if (!textarea || suppressDraftCapture) return;
 
         const chatId = parseChatId();
         if (!chatId) return;
+
+        if (editorSession?.chatId === chatId && editorSession.kind === 'preset') {
+            updateEditorSessionFromTextarea(textarea, true);
+            return;
+        }
+
+        if (editorSession?.chatId === chatId && editorSession.kind === 'current') {
+            editorSession.content = textarea.value || '';
+            editorSession.isExtend = getVisibleUserNoteExtendState(textarea);
+            editorSession.dirty = true;
+            currentEditorDraft = {
+                chatId,
+                content: editorSession.content,
+                isExtend: editorSession.isExtend,
+                dirty: true,
+            };
+            renderModeSlots();
+        }
 
         const modeKey = getCurrentAppliedModeForChat();
 
@@ -1554,6 +560,10 @@
         const chatId = parseChatId();
         if (!chatId) return false;
 
+        if (editorSession?.chatId === chatId && editorSession.kind === 'preset') {
+            return false;
+        }
+
         let draft = editingUserNoteDraft;
 
         if (!draft && textarea) {
@@ -1586,7 +596,6 @@
         const notes = getModeNotes();
 
         notes[draft.modeKey] = {
-            ...normalizeModePreset(notes[draft.modeKey]),
             content: draft.content || '',
             isExtend: !!draft.isExtend,
             updatedAt: Date.now(),
@@ -1621,7 +630,21 @@
                 isExtend: !!draft.isExtend,
             });
 
+            currentServerUserNote = {
+                chatId: draft.chatId,
+                content: draft.content || '',
+                isExtend: !!draft.isExtend,
+                fetchedAt: Date.now(),
+            };
+            if (editorSession?.chatId === draft.chatId && editorSession.kind === 'current') {
+                editorSession.content = draft.content || '';
+                editorSession.isExtend = !!draft.isExtend;
+                editorSession.dirty = false;
+                editorSession.loading = false;
+            }
+            currentEditorDraft = null;
             clearEditingUserNoteDraft('committed');
+            renderModeSlots();
             return true;
         } catch (err) {
             console.error('[채팅모드별 유저노트 자동변경] draft 서버 저장 실패', err);
@@ -1632,22 +655,30 @@
     }
 
     function attachUserNoteDraftTracker(textarea) {
-        if (!textarea || textarea.dataset.modeUserNoteDraftTrackerAttached === '1') return;
-
-        textarea.dataset.modeUserNoteDraftTrackerAttached = '1';
+        if (!textarea) return;
 
         const capture = () => {
             if (suppressDraftCapture) return;
             captureEditingUserNoteDraft(textarea);
         };
 
-        textarea.addEventListener('input', capture);
-        textarea.addEventListener('change', capture);
-        textarea.addEventListener('keyup', capture);
-        textarea.addEventListener('paste', () => {
-            setTimeout(capture, 0);
-        });
-        textarea.addEventListener('compositionend', capture);
+        if (textarea.dataset.modeUserNoteDraftTrackerAttached !== '1') {
+            textarea.dataset.modeUserNoteDraftTrackerAttached = '1';
+            textarea.addEventListener('input', capture);
+            textarea.addEventListener('change', capture);
+            textarea.addEventListener('keyup', capture);
+            textarea.addEventListener('paste', () => {
+                setTimeout(capture, 0);
+            });
+            textarea.addEventListener('compositionend', capture);
+        }
+
+        const root = getUserNoteRootFromTextarea(textarea);
+        const switchBtn = root?.querySelector('button[role="switch"]');
+        if (switchBtn && switchBtn.dataset.modeUserNoteDraftTrackerAttached !== '1') {
+            switchBtn.dataset.modeUserNoteDraftTrackerAttached = '1';
+            switchBtn.addEventListener('click', () => setTimeout(capture, 0));
+        }
     }
 
     function isLikelyUserNoteSaveButton(button) {
@@ -1674,6 +705,35 @@
 
         saveInterceptorAttached = true;
 
+        const handlePresetExtendSwitch = event => {
+            const switchBtn = event.target?.closest?.('button[role="switch"]');
+            if (!switchBtn) return;
+
+            const chatId = parseChatId();
+            const textarea = findVisibleUserNoteTextarea();
+            if (!chatId || !textarea || editorSession?.chatId !== chatId || editorSession.kind !== 'preset') return;
+
+            const root = getUserNoteRootFromTextarea(textarea);
+            if (root && !root.contains(switchBtn)) return;
+
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+
+            editorSession.isExtend = !editorSession.isExtend;
+            editorSession.content = textarea.value || '';
+            editorSession.dirty = true;
+            presetEditorDrafts.set(getPresetDraftKey(chatId, editorSession.modeKey), {
+                content: editorSession.content,
+                isExtend: editorSession.isExtend,
+                dirty: true,
+            });
+
+            updateUserNoteCounterUI(textarea, editorSession.content, editorSession.isExtend);
+            updateUserNoteExtendSwitchUI(textarea, editorSession.isExtend);
+            renderModeSlots();
+        };
+
         const handleSave = event => {
             const button = event.target?.closest?.('button');
             if (!button) return;
@@ -1686,6 +746,20 @@
             if (dialog && !dialog.contains(button)) return;
 
             if (!isLikelyUserNoteSaveButton(button)) return;
+
+            const chatId = parseChatId();
+            if (editorSession?.chatId === chatId && editorSession.kind === 'preset') {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+
+                const now = Date.now();
+                if (event.type === 'pointerdown' || now - lastPresetSaveInterceptAt > 500) {
+                    lastPresetSaveInterceptAt = now;
+                    saveSelectedPreset();
+                }
+                return;
+            }
 
             const buttonText = (button.textContent || '').replace(/\s+/g, '').trim();
 
@@ -1708,6 +782,7 @@
             }, 80);
         };
 
+        document.addEventListener('click', handlePresetExtendSwitch, true);
         document.addEventListener('pointerdown', handleSave, true);
         document.addEventListener('click', handleSave, true);
     }
@@ -1720,49 +795,66 @@
         if (!textarea) return;
 
         attachUserNoteDraftTracker(textarea);
-
         restoreLastAppliedNoteIfNeeded();
 
-        if (lastAppliedUserNoteChatId === chatId && lastAppliedUserNoteMode) {
-            const immediateContent = lastAppliedUserNoteContent || '';
-            const immediateIsExtend = !!lastAppliedUserNoteIsExtend;
+        const isNewEditor =
+            editorSession?.textarea !== textarea ||
+            editorSession?.chatId !== chatId;
 
-            const immediateKey = `${chatId}:immediate:${lastAppliedUserNoteMode}:${countChars(immediateContent)}:${immediateIsExtend}`;
+        lastSeenUserNoteTextarea = textarea;
 
-            if (lastSyncedUserNoteKey !== immediateKey || textarea.value !== immediateContent) {
-                setDisplayTextareaValueOnly(textarea, immediateContent);
-                updateUserNoteCounterUI(textarea, immediateContent, immediateIsExtend);
-                updateUserNoteExtendSwitchUI(textarea, immediateIsExtend);
-                syncUserNoteTextareaHeightLikeCrack(textarea);
-
-                lastSyncedUserNoteKey = immediateKey;
-
-                console.log('[채팅모드별 유저노트 자동변경] 유저노트 창을 마지막 적용값으로 즉시 동기화했습니다.', {
-                    chatId,
-                    mode: lastAppliedUserNoteMode,
-                    length: countChars(immediateContent),
-                    isExtend: immediateIsExtend,
-                });
-            }
+        if (isNewEditor) {
+            editorSession = {
+                chatId,
+                textarea,
+                kind: 'current',
+                modeKey: '',
+                content: textarea.value || '',
+                isExtend: getVisibleUserNoteExtendState(textarea),
+                dirty: false,
+                loading: true,
+            };
+            currentServerUserNote = {
+                chatId,
+                content: textarea.value || '',
+                isExtend: getVisibleUserNoteExtendState(textarea),
+                fetchedAt: 0,
+                pending: true,
+            };
+            lastSyncedUserNoteKey = '';
         }
+
+        ensureInlineEditorUI(textarea);
+        renderModeSlots();
 
         try {
             const serverNote = await fetchCurrentUserNote(chatId);
+
+            if (parseChatId() !== chatId || findVisibleUserNoteTextarea() !== textarea) return;
 
             const content = serverNote.content || '';
             const isExtend = !!serverNote.isExtend;
             const serverKey = `${chatId}:server:${countChars(content)}:${isExtend}:${content.slice(0, 40)}`;
 
-            if (lastSyncedUserNoteKey === serverKey && textarea.value === content) {
-                return;
+            currentServerUserNote = { chatId, content, isExtend, fetchedAt: Date.now() };
+            lastSyncedUserNoteKey = serverKey;
+
+            if (
+                editorSession?.chatId === chatId &&
+                editorSession.kind === 'current' &&
+                !editorSession.dirty
+            ) {
+                editorSession.content = content;
+                editorSession.isExtend = isExtend;
+                editorSession.loading = false;
+                setDisplayTextareaValueOnly(textarea, content);
+                updateUserNoteCounterUI(textarea, content, isExtend);
+                updateUserNoteExtendSwitchUI(textarea, isExtend);
+                syncUserNoteTextareaHeightLikeCrack(textarea);
+                currentEditorDraft = null;
             }
 
-            setDisplayTextareaValueOnly(textarea, content);
-            updateUserNoteCounterUI(textarea, content, isExtend);
-            updateUserNoteExtendSwitchUI(textarea, isExtend);
-            syncUserNoteTextareaHeightLikeCrack(textarea);
-
-            lastSyncedUserNoteKey = serverKey;
+            renderModeSlots();
 
             console.log('[채팅모드별 유저노트 자동변경] 유저노트 창을 서버값으로 검증 동기화했습니다.', {
                 chatId,
@@ -1771,6 +863,10 @@
             });
         } catch (err) {
             console.warn('[채팅모드별 유저노트 자동변경] 서버값 검증 실패', err);
+            if (editorSession?.chatId === chatId) {
+                editorSession.loading = false;
+                renderModeSlots();
+            }
         }
     }
 
@@ -1801,6 +897,21 @@
 
         const isExtend = !!patchedUserNote.isExtend;
 
+        currentServerUserNote = {
+            chatId,
+            content,
+            isExtend,
+            fetchedAt: Date.now(),
+        };
+
+        if (editorSession?.chatId === chatId && editorSession.kind === 'current') {
+            editorSession.content = content;
+            editorSession.isExtend = isExtend;
+            editorSession.dirty = false;
+            editorSession.loading = false;
+        }
+        currentEditorDraft = null;
+
         const modeKey =
             modeKeyOverride ||
             getPendingPatchMode(chatId, { content, isExtend }) ||
@@ -1808,13 +919,13 @@
 
         if (!modeKey) {
             console.log('[채팅모드별 유저노트 자동변경] 현재 적용 모드를 알 수 없어 PATCH 유저노트를 프리셋에 반영하지 않았습니다.');
+            renderModeSlots();
             return;
         }
 
         const notes = getModeNotes();
 
         notes[modeKey] = {
-            ...normalizeModePreset(notes[modeKey]),
             content,
             isExtend,
             updatedAt: Date.now(),
@@ -1909,6 +1020,12 @@
                         const chatIdFromEvent = parsed?.eventProperties?.chat_id;
                         const chatId = chatIdFromEvent || parseChatId();
 
+                        if (chatId && CHAT_MODES.some(mode => mode.key === chatMode)) {
+                            lastDetectedChatId = chatId;
+                            lastDetectedModeKey = chatMode;
+                            renderModeSlots();
+                        }
+
                         console.log('[채팅모드별 유저노트 자동변경 감지]', {
                             chatId,
                             chatMode,
@@ -1971,246 +1088,190 @@
     }
 
     GM_addStyle(`
-        #mun-toggle-btn {
-            position: fixed;
-            right: 20px;
-            bottom: 20px;
-            z-index: 999999;
-            width: 52px;
-            height: 52px;
-            border: none;
-            border-radius: 50%;
-            background: #6A3DE8;
-            color: #fff;
-            font-size: 22px;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+        #mun-inline-editor {
+            width: 100%;
+            box-sizing: border-box;
+            margin: 0 0 6px;
+            color: inherit;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        #mun-inline-footer {
+            width: 100%;
+            box-sizing: border-box;
+            margin: 6px 0 0;
+            color: inherit;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .mun-heading {
             display: flex;
             align-items: center;
-            justify-content: center;
-            touch-action: none;
-            transition: transform .15s ease, opacity .15s ease, background .15s ease;
+            gap: 5px;
+            min-width: 0;
+            margin: 0 2px 8px;
+            color: #77736f;
+            line-height: 1.35;
         }
 
-        #mun-toggle-btn:hover {
-            transform: scale(1.05);
-            background: #5a31cf;
+        .mun-heading strong {
+            overflow: hidden;
+            color: #262421;
+            font-weight: 650;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
-        #mun-toggle-btn.dragging {
-            opacity: 0.85;
-            transform: scale(1.08);
-            transition: none;
+        .mun-heading-sep { opacity: .55; }
+
+        .mun-chip-scroll {
+            display: flex;
+            gap: 6px;
+            width: 100%;
+            padding: 1px 2px 6px;
+            overflow-x: auto;
+            overscroll-behavior-x: contain;
+            scrollbar-width: thin;
+            -webkit-overflow-scrolling: touch;
         }
 
-        #mun-panel {
-            position: fixed;
-            right: 20px;
-            bottom: 82px;
-            z-index: 999999;
-            width: 520px;
-            max-width: 94vw;
-            max-height: 82vh;
-            overflow-y: auto;
-            background: #F7F7F5;
-            border: 1px solid #C7C5BD;
-            border-radius: 12px;
-            box-shadow: 0 8px 22px rgba(0,0,0,0.15);
-            padding: 14px;
-            display: none;
-            font-family: sans-serif;
+        .mun-chip {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            flex: 0 0 auto;
+            min-height: 30px;
+            box-sizing: border-box;
+            border: 1px solid #dedbd7;
+            border-radius: 999px;
+            padding: 5px 10px;
+            background: #f7f6f4;
+            color: #5d5954;
+            font: inherit;
+            font-weight: 600;
+            line-height: 1;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: border-color .15s ease, background .15s ease, color .15s ease;
         }
 
-        #mun-panel.show {
-            display: block;
+        .mun-chip:hover { background: #efedeb; }
+
+        .mun-chip.is-empty { color: #98938d; }
+
+        .mun-note-dot {
+            width: 5px;
+            height: 5px;
+            box-sizing: border-box;
+            border: 1px solid currentColor;
+            border-radius: 50%;
+            opacity: .65;
         }
 
-        #mun-panel h3 {
-            font-size: 15px;
-            color: #1A1918;
+        .mun-chip.has-note .mun-note-dot {
+            border-color: #7d756e;
+            background: #7d756e;
+            opacity: .9;
         }
 
-        .mun-panel-header {
+        .mun-chip.is-selected {
+            border-color: #7655d9;
+            background: #eee9ff;
+            color: #5330b8;
+            box-shadow: 0 0 0 1px rgba(118, 85, 217, .08);
+        }
+
+        .mun-chip.is-active { padding-right: 18px; }
+
+        .mun-chip.is-active i {
+            position: absolute;
+            top: 6px;
+            right: 7px;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #7354d6;
+            box-shadow: 0 0 0 2px #f7f6f4;
+        }
+
+        .mun-chip.is-active.is-selected i { box-shadow: 0 0 0 2px #eee9ff; }
+
+        .mun-current { font-weight: 700; }
+
+        .mun-footer {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 10px;
-            margin-bottom: 10px;
-        }
-
-        .mun-panel-header h3 {
-            margin: 0;
-        }
-
-        #mun-close-btn {
-            border: none;
-            background: transparent;
-            color: #61605A;
-            font-size: 22px;
-            line-height: 1;
-            cursor: pointer;
-            padding: 4px 7px;
-            border-radius: 6px;
-        }
-
-        #mun-close-btn:hover {
-            background: rgba(0,0,0,0.06);
-            color: #1A1918;
+            gap: 8px;
+            min-width: 0;
+            margin: 4px 2px 0;
         }
 
         #mun-status {
-            font-size: 12px;
-            line-height: 1.5;
-            min-height: 18px;
-            margin-bottom: 10px;
-            color: #61605A;
-            word-break: break-word;
-        }
-
-        .mun-top-actions {
-            display: flex;
-            gap: 6px;
-            margin-bottom: 10px;
-            flex-wrap: wrap;
-        }
-
-        .mun-btn {
-            border: none;
-            border-radius: 8px;
-            padding: 8px 10px;
-            font-size: 12px;
-            cursor: pointer;
-            white-space: nowrap;
-        }
-
-        .mun-btn.primary { background: #6A3DE8; color: white; }
-        .mun-btn.gray { background: #61605A; color: white; }
-        .mun-btn.red { background: #C0392B; color: white; }
-
-        .mun-mode-slot {
-            border: 1px solid #D9D7CF;
-            border-radius: 10px;
-            background: white;
-            padding: 10px;
-            margin-bottom: 10px;
-        }
-
-        .mun-mode-header {
-            display: flex;
-            justify-content: space-between;
-            gap: 8px;
-            align-items: flex-start;
-            margin-bottom: 8px;
-        }
-
-        .mun-mode-title {
-            font-size: 13px;
-            font-weight: bold;
-            color: #1A1918;
-            word-break: break-word;
-        }
-
-        .mun-mode-key {
-            font-size: 11px;
-            padding: 2px 6px;
-            border-radius: 999px;
-            background: #EEEAFD;
-            color: #5a31cf;
-            white-space: nowrap;
-        }
-
-        .mun-meta {
-            font-size: 11px;
-            color: #777;
-            margin-bottom: 8px;
-            line-height: 1.5;
-        }
-
-        .mun-preview {
-            font-size: 12px;
-            color: #555;
-            background: #FAFAF8;
-            border: 1px solid #ECEAE4;
-            border-radius: 8px;
-            padding: 8px;
-            white-space: pre-wrap;
-            word-break: break-word;
-            max-height: 70px;
+            min-width: 0;
+            min-height: 0;
+            margin: 0;
             overflow: hidden;
-            margin-bottom: 8px;
-        }
-
-        .mun-textarea {
-            width: 100%;
-            min-height: 130px;
-            resize: vertical;
-            box-sizing: border-box;
-            border: 1px solid #C7C5BD;
-            border-radius: 8px;
-            padding: 8px;
-            font-size: 12px;
-            font-family: sans-serif;
-            line-height: 1.5;
-            color: #1A1918;
-            background: #FFFFFF;
-            margin-bottom: 8px;
-        }
-
-        .mun-field-title {
-            font-size: 12px;
-            font-weight: bold;
-            color: #444;
-            margin: 10px 0 6px;
-        }
-
-        .mun-ooc-textarea {
-            min-height: 100px;
+            color: #77736f;
+            line-height: 1.35;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .mun-actions {
             display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
+            flex: 0 0 auto;
+            flex-wrap: nowrap;
             align-items: center;
+            gap: 3px;
         }
 
-        .mun-extend-label {
-            font-size: 12px;
-            color: #555;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            margin-right: 4px;
+        .mun-action {
+            border: 0;
+            border-radius: 6px;
+            padding: 5px 7px;
+            background: transparent;
+            color: #6d6862;
+            font: inherit;
+            font-weight: 600;
+            white-space: nowrap;
+            cursor: pointer;
         }
 
-        .mun-empty {
-            font-size: 12px;
-            color: #777;
-            padding: 10px 4px;
+        .mun-action:hover { background: #efedeb; color: #292724; }
+        .mun-action.is-primary { color: #6541ca; }
+
+        .mun-context-note {
+            margin: 5px 2px 0;
+            color: #9a958f;
+            font-size: 11px;
+            line-height: 1.35;
         }
 
-        #mun-toast {
-            position: fixed;
-            left: 50%;
-            bottom: 90px;
-            transform: translateX(-50%);
-            z-index: 1000000;
-            background: rgba(30,30,30,0.92);
-            color: white;
-            padding: 10px 16px;
-            border-radius: 18px;
-            font-size: 12px;
-            font-family: sans-serif;
-            opacity: 0;
-            transition: opacity .25s ease;
-            pointer-events: none;
-            max-width: 88vw;
-            text-align: center;
-            word-break: break-word;
+        @media (max-width: 560px) {
+            .mun-heading { flex-wrap: wrap; }
+            .mun-footer { align-items: flex-start; flex-direction: column; }
+            .mun-actions { width: 100%; overflow-x: auto; padding-bottom: 2px; }
+            #mun-status { max-width: 100%; white-space: normal; }
+            .mun-context-note { display: none; }
         }
 
-        #mun-toast.show {
-            opacity: 1;
+        @media (prefers-color-scheme: dark) {
+            .mun-heading { color: #aaa6a1; }
+            .mun-heading strong { color: #f0eeeb; }
+            .mun-chip { border-color: #4b4844; background: #302e2b; color: #d1cdc8; }
+            .mun-chip:hover { background: #3a3733; }
+            .mun-chip.is-empty { color: #8f8a84; }
+            .mun-chip.is-selected { border-color: #9a7cff; background: #3b315c; color: #d9ccff; }
+            .mun-chip.is-active i { box-shadow: 0 0 0 2px #302e2b; background: #a98fff; }
+            .mun-chip.is-active.is-selected i { box-shadow: 0 0 0 2px #3b315c; }
+            #mun-status, .mun-action { color: #aaa6a1; }
+            .mun-action:hover { background: #3a3733; color: #f0eeeb; }
+            .mun-action.is-primary { color: #baa5ff; }
+            .mun-context-note { color: #817d78; }
         }
     `);
 
@@ -2232,214 +1293,243 @@
     }
 
     function buildUI() {
-        if (document.getElementById('mun-toggle-btn')) return;
+        document.getElementById('mun-toggle-btn')?.remove();
+        document.getElementById('mun-panel')?.remove();
 
-        const btn = document.createElement('button');
-        btn.id = 'mun-toggle-btn';
-        btn.textContent = '🧩';
+        if (!document.getElementById('mun-toast')) {
+            const toast = document.createElement('div');
+            toast.id = 'mun-toast';
+            document.body.appendChild(toast);
+        }
+    }
 
-        const panel = document.createElement('div');
-        panel.id = 'mun-panel';
-        panel.innerHTML = `
-            <div class="mun-panel-header">
-                <h3>채팅모드별 유저노트 · WRMC OOC</h3>
-                <button id="mun-close-btn" type="button" aria-label="닫기">×</button>
-            </div>
+    function ensureInlineEditorUI(textarea) {
+        if (!textarea) return null;
 
-            <div id="mun-status">준비되었습니다.</div>
+        let container = document.getElementById('mun-inline-editor');
+        let footer = document.getElementById('mun-inline-footer');
 
-            <div class="mun-top-actions">
-                <button id="mun-export-btn" class="mun-btn gray">전체 내보내기</button>
-                <button id="mun-import-btn" class="mun-btn gray">전체 가져오기</button>
-            </div>
-
-            <div id="mun-slots"></div>
-        `;
-
-        const toast = document.createElement('div');
-        toast.id = 'mun-toast';
-
-        document.body.appendChild(btn);
-        document.body.appendChild(panel);
-        document.body.appendChild(toast);
-
-        const savedX = GM_getValue(BTN_POS_KEY_X, null);
-        const savedY = GM_getValue(BTN_POS_KEY_Y, null);
-
-        if (savedX !== null && savedY !== null) {
-            btn.style.left = `${savedX}px`;
-            btn.style.top = `${savedY}px`;
-            btn.style.right = 'auto';
-            btn.style.bottom = 'auto';
+        if (container?.dataset.textareaId !== textarea.dataset.munTextareaId) {
+            container?.remove();
+            footer?.remove();
+            container = null;
+            footer = null;
         }
 
-        if (getPanelOpen()) {
-            panel.classList.add('show');
+        if (footer?.dataset.textareaId !== textarea.dataset.munTextareaId) {
+            footer.remove();
+            footer = null;
         }
 
-        btn.addEventListener('click', () => {
-            if (btn.dataset.dragged === '1') {
-                btn.dataset.dragged = '0';
-                return;
-            }
+        if (!textarea.dataset.munTextareaId) {
+            textarea.dataset.munTextareaId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        }
 
-            panel.classList.toggle('show');
-            setPanelOpen(panel.classList.contains('show'));
+        if (!container) {
+            container = document.createElement('section');
+            container.id = 'mun-inline-editor';
+            container.dataset.textareaId = textarea.dataset.munTextareaId;
+            container.setAttribute('aria-label', '모델별 유저노트 프리셋');
+            textarea.parentElement?.insertBefore(container, textarea);
+        }
 
-            if (panel.classList.contains('show')) {
-                renderModeSlots();
-            }
-        });
+        if (!footer) {
+            footer = document.createElement('section');
+            footer.id = 'mun-inline-footer';
+            footer.dataset.textareaId = textarea.dataset.munTextareaId;
+            footer.setAttribute('aria-label', '모델별 유저노트 프리셋 상태와 작업');
+            textarea.insertAdjacentElement('afterend', footer);
+        }
 
-        document.getElementById('mun-close-btn')?.addEventListener('click', () => {
-            panel.classList.remove('show');
-            setPanelOpen(false);
-        });
+        return container;
+    }
 
-        document.getElementById('mun-export-btn')?.addEventListener('click', exportModeNotes);
-        document.getElementById('mun-import-btn')?.addEventListener('click', importModeNotes);
+    function applyEditorSessionToNativeTextarea() {
+        const textarea = findVisibleUserNoteTextarea();
+        if (!textarea || !editorSession) return;
 
-        attachDrag(btn);
+        setDisplayTextareaValueOnly(textarea, editorSession.content || '');
+        updateUserNoteCounterUI(textarea, editorSession.content || '', !!editorSession.isExtend);
+        updateUserNoteExtendSwitchUI(textarea, !!editorSession.isExtend);
+        syncUserNoteTextareaHeightLikeCrack(textarea);
+    }
+
+    function selectEditorView(kind, modeKey = '') {
+        const chatId = parseChatId();
+        const textarea = findVisibleUserNoteTextarea();
+        if (!chatId || !textarea) return;
+
+        if (editorSession?.chatId === chatId) {
+            updateEditorSessionFromTextarea(textarea, false);
+        }
+
+        if (kind === 'current') {
+            const draft = currentEditorDraft?.chatId === chatId
+                ? currentEditorDraft
+                : editingUserNoteDraft?.chatId === chatId
+                    ? editingUserNoteDraft
+                    : null;
+            const source = draft || currentServerUserNote || {
+                content: textarea.value || '',
+                isExtend: getVisibleUserNoteExtendState(textarea),
+            };
+
+            editorSession = {
+                chatId,
+                textarea,
+                kind: 'current',
+                modeKey: '',
+                content: source.content || '',
+                isExtend: !!source.isExtend,
+                dirty: !!draft,
+                loading: !currentServerUserNote || !!currentServerUserNote.pending,
+            };
+        } else {
+            const notes = getModeNotes();
+            const saved = notes[modeKey] || { content: '', isExtend: false, updatedAt: null };
+            const cached = presetEditorDrafts.get(getPresetDraftKey(chatId, modeKey));
+            const source = cached || saved;
+
+            editorSession = {
+                chatId,
+                textarea,
+                kind: 'preset',
+                modeKey,
+                content: source.content || '',
+                isExtend: !!source.isExtend,
+                dirty: !!cached?.dirty,
+                loading: false,
+            };
+        }
+
+        applyEditorSessionToNativeTextarea();
         renderModeSlots();
     }
 
     function renderModeSlots() {
-        const container = document.getElementById('mun-slots');
-        if (!container) return;
+        const container = document.getElementById('mun-inline-editor');
+        const footer = document.getElementById('mun-inline-footer');
+        if (!container || !footer) return;
 
         const chatId = parseChatId();
         const notes = getModeNotes();
 
-        if (!chatId) {
-            container.innerHTML = `<div class="mun-empty">채팅방 페이지에서만 채팅방별 프리셋을 사용할 수 있습니다.</div>`;
-            return;
-        }
+        const activeMode = getCurrentAppliedModeForChat();
+        const activeLabel = activeMode ? getModeLabel(activeMode) : '감지 대기';
+        const selectedMode = editorSession?.kind === 'preset' ? editorSession.modeKey : '';
+        const selectedNote = selectedMode ? notes[selectedMode] : null;
+        const selectedLabel = selectedMode ? getModeLabel(selectedMode) : '';
+        const content = editorSession?.content || '';
 
-        container.innerHTML = CHAT_MODES.map(mode => {
-            const note = normalizeModePreset(notes[mode.key]);
+        const chips = CHAT_MODES.map(mode => {
+            const note = notes[mode.key] || { content: '', updatedAt: null };
+            const selected = selectedMode === mode.key;
+            const active = activeMode === mode.key;
+            const state = note.content ? '저장됨' : '비어 있음';
 
             return `
-                <div class="mun-mode-slot" data-mode="${escapeHtml(mode.key)}">
-                    <div class="mun-mode-header">
-                        <div class="mun-mode-title">${escapeHtml(mode.label)}</div>
-                        <div class="mun-mode-key">${escapeHtml(mode.key)}</div>
-                    </div>
-
-                    <div class="mun-meta">
-                        현재 채팅방: ${escapeHtml(chatId)}
-                        <br>
-                        마지막 저장: ${escapeHtml(formatTime(note.updatedAt))}
-                        <br>
-                        확장 모드: ${note.isExtend ? '켜짐' : '꺼짐'}
-                        <br>
-                        WRMC 모델별 OOC: ${note.wrmcOocEnabled ? '사용' : '사용 안 함'}
-                    </div>
-
-                    <div class="mun-field-title">유저노트</div>
-                    <div class="mun-preview">${escapeHtml(previewText(note.content))}</div>
-
-                    <textarea
-                        class="mun-textarea"
-                        data-mode-textarea="${escapeHtml(mode.key)}"
-                        placeholder="${escapeHtml(mode.label)}에서 자동 적용할 유저노트를 입력하세요."
-                    >${escapeHtml(note.content)}</textarea>
-
-                    <div class="mun-field-title">WRMC 모델별 OOC</div>
-                    <textarea
-                        class="mun-textarea mun-ooc-textarea"
-                        data-mode-wrmc-ooc="${escapeHtml(mode.key)}"
-                        placeholder="${escapeHtml(mode.label)}에서 WRMC 전용 모델별 OOC 슬롯에 적용할 내용을 입력하세요."
-                    >${escapeHtml(note.wrmcOocContent)}</textarea>
-
-                    <div class="mun-actions">
-                        <label class="mun-extend-label">
-                            <input
-                                type="checkbox"
-                                data-mode-extend="${escapeHtml(mode.key)}"
-                                ${note.isExtend ? 'checked' : ''}
-                            >
-                            확장 모드
-                        </label>
-
-                        <label class="mun-extend-label">
-                            <input
-                                type="checkbox"
-                                data-mode-wrmc-enabled="${escapeHtml(mode.key)}"
-                                ${note.wrmcOocEnabled ? 'checked' : ''}
-                            >
-                            WRMC OOC 사용
-                        </label>
-
-                        <button class="mun-btn primary" data-action-save="${escapeHtml(mode.key)}">저장</button>
-                        <button class="mun-btn gray" data-action-load="${escapeHtml(mode.key)}">현재 유저노트 불러오기</button>
-                        <button class="mun-btn red" data-action-clear="${escapeHtml(mode.key)}">비우기</button>
-                    </div>
-                </div>
+                <button
+                    type="button"
+                    class="mun-chip${selected ? ' is-selected' : ''}${active ? ' is-active' : ''}${note.content ? ' has-note' : ' is-empty'}"
+                    data-mun-mode="${escapeHtml(mode.key)}"
+                    title="${escapeHtml(mode.label)} 프리셋 · ${state}${active ? ' · 현재 모델' : ''}"
+                    aria-pressed="${selected ? 'true' : 'false'}"
+                ><b class="mun-note-dot" aria-hidden="true"></b><span>${escapeHtml(mode.shortLabel || mode.label)}</span>${active ? '<i aria-hidden="true"></i>' : ''}</button>
             `;
         }).join('');
 
-        CHAT_MODES.forEach(mode => {
-            container.querySelector(`[data-action-save="${CSS.escape(mode.key)}"]`)?.addEventListener('click', () => {
-                saveModeNote(mode.key);
-            });
+        let meta;
+        if (editorSession?.kind === 'preset') {
+            const state = editorSession.dirty
+                ? '수정 중'
+                : selectedNote?.content
+                    ? '저장됨'
+                    : '비어 있음';
+            meta = `${selectedLabel} 프리셋 · ${state} · ${countChars(content)}자${editorSession.isExtend ? ' · 확장' : ''}`;
+        } else {
+            meta = `실제 서버 유저노트${editorSession?.loading ? ' 불러오는 중' : ''} · ${countChars(content)}자${editorSession?.isExtend ? ' · 확장' : ''}`;
+        }
 
-            container.querySelector(`[data-action-load="${CSS.escape(mode.key)}"]`)?.addEventListener('click', () => {
-                loadCurrentUserNoteToMode(mode.key);
-            });
+        container.innerHTML = `
+            <div class="mun-heading">
+                <span>현재 모델</span>
+                <strong>${escapeHtml(activeLabel)}</strong>
+                <span class="mun-heading-sep">·</span>
+                <span>${editorSession?.kind === 'preset' ? `${escapeHtml(selectedLabel)} 프리셋 편집` : '서버 유저노트 편집'}</span>
+            </div>
+            <div class="mun-chip-scroll" role="tablist" aria-label="유저노트 보기 선택">
+                <button type="button" class="mun-chip mun-current${editorSession?.kind !== 'preset' ? ' is-selected' : ''}" data-mun-current aria-pressed="${editorSession?.kind !== 'preset'}">현재</button>
+                ${chips}
+            </div>
+        `;
 
-            container.querySelector(`[data-action-clear="${CSS.escape(mode.key)}"]`)?.addEventListener('click', () => {
-                clearModeNote(mode.key);
-            });
+        footer.innerHTML = `
+            <div class="mun-footer">
+                <span id="mun-status">${escapeHtml(meta)}</span>
+                <div class="mun-actions">
+                    ${editorSession?.kind === 'preset' ? `
+                        <button type="button" class="mun-action is-primary" data-mun-save>프리셋 저장</button>
+                        <button type="button" class="mun-action" data-mun-load-current>현재값 불러오기</button>
+                        <button type="button" class="mun-action" data-mun-clear>비우기</button>
+                    ` : ''}
+                    <button type="button" class="mun-action" data-mun-export title="현재 채팅방의 모든 프리셋 내보내기">내보내기</button>
+                    <button type="button" class="mun-action" data-mun-import title="현재 채팅방에 프리셋 가져오기">가져오기</button>
+                </div>
+            </div>
+            <div class="mun-context-note">
+                ${editorSession?.kind === 'preset'
+                    ? '프리셋 보기입니다. 칩 전환이나 프리셋 저장은 서버 유저노트를 변경하지 않습니다.'
+                    : `Crack 저장 시 서버와 현재 모델${activeMode ? `(${escapeHtml(activeLabel)})` : ''} 프리셋이 함께 동기화됩니다.`}
+            </div>
+        `;
+
+        container.querySelector('[data-mun-current]')?.addEventListener('click', () => selectEditorView('current'));
+        container.querySelectorAll('[data-mun-mode]').forEach(button => {
+            button.addEventListener('click', () => selectEditorView('preset', button.dataset.munMode));
         });
+        footer.querySelector('[data-mun-save]')?.addEventListener('click', saveSelectedPreset);
+        footer.querySelector('[data-mun-load-current]')?.addEventListener('click', loadCurrentUserNoteToSelectedPreset);
+        footer.querySelector('[data-mun-clear]')?.addEventListener('click', clearSelectedPreset);
+        footer.querySelector('[data-mun-export]')?.addEventListener('click', exportModeNotes);
+        footer.querySelector('[data-mun-import]')?.addEventListener('click', importModeNotes);
     }
 
-    async function saveModeNote(modeKey) {
-        const textarea = document.querySelector(`[data-mode-textarea="${CSS.escape(modeKey)}"]`);
-        const extendInput = document.querySelector(`[data-mode-extend="${CSS.escape(modeKey)}"]`);
-        const wrmcOocTextarea = document.querySelector(`[data-mode-wrmc-ooc="${CSS.escape(modeKey)}"]`);
-        const wrmcOocEnabledInput = document.querySelector(`[data-mode-wrmc-enabled="${CSS.escape(modeKey)}"]`);
+    function saveSelectedPreset() {
+        const chatId = parseChatId();
+        const textarea = findVisibleUserNoteTextarea();
+        const modeKey = editorSession?.kind === 'preset' ? editorSession.modeKey : '';
+        if (!chatId || !textarea || !modeKey) return;
 
-        if (!textarea) return;
+        updateEditorSessionFromTextarea(textarea, true);
 
         const notes = getModeNotes();
 
         notes[modeKey] = {
-            content: textarea.value || '',
-            isExtend: !!extendInput?.checked,
-            wrmcOocContent: wrmcOocTextarea?.value || '',
-            wrmcOocEnabled: !!wrmcOocEnabledInput?.checked,
+            content: editorSession.content || '',
+            isExtend: !!editorSession.isExtend,
             updatedAt: Date.now(),
         };
 
         setModeNotes(notes);
-
-        const currentMode = getCurrentAppliedModeForChat();
-        const chatId = parseChatId();
-        let applyResult = null;
-
-        if (chatId && currentMode === modeKey) {
-            applyResult = await applyPresetByChatMode(chatId, modeKey, { force: true, source: 'manual-save' });
-        }
+        editorSession.dirty = false;
+        presetEditorDrafts.set(getPresetDraftKey(chatId, modeKey), {
+            content: editorSession.content || '',
+            isExtend: !!editorSession.isExtend,
+            dirty: false,
+        });
 
         renderModeSlots();
 
-        if (applyResult?.userNoteError || applyResult?.wrmcError) {
-            const failed = [
-                applyResult.userNoteError ? '유저노트' : '',
-                applyResult.wrmcError ? 'WRMC OOC' : '',
-            ].filter(Boolean).join('·');
-            setStatus(`${getModeLabel(modeKey)} 프리셋은 저장했지만 ${failed} 즉시 적용은 실패했습니다.`);
-            showToast(`${getModeLabel(modeKey)} 저장 · ${failed} 적용 실패`);
-        } else {
-            setStatus(`${getModeLabel(modeKey)} 프리셋을 현재 채팅방에 저장했습니다.`);
-            showToast(`${getModeLabel(modeKey)} 저장 완료`);
-        }
+        setStatus(`${getModeLabel(modeKey)} 프리셋을 현재 채팅방에 저장했습니다.`);
+        showToast(`${getModeLabel(modeKey)} 저장 완료`);
     }
 
-    async function loadCurrentUserNoteToMode(modeKey) {
+    async function loadCurrentUserNoteToSelectedPreset() {
         const chatId = parseChatId();
+        const textarea = findVisibleUserNoteTextarea();
+        const modeKey = editorSession?.kind === 'preset' ? editorSession.modeKey : '';
 
-        if (!chatId) {
+        if (!chatId || !textarea || !modeKey) {
             setStatus('채팅방 페이지에서만 사용할 수 있습니다.');
             showToast('채팅방 페이지에서만 사용할 수 있습니다.');
             return;
@@ -2457,27 +1547,21 @@
             setStatus('현재 채팅방 유저노트를 불러오는 중입니다...');
 
             const current = await fetchCurrentUserNote(chatId);
-            const notes = getModeNotes();
+            currentServerUserNote = { chatId, ...current, fetchedAt: Date.now() };
+            editorSession.content = current.content || '';
+            editorSession.isExtend = !!current.isExtend;
+            editorSession.dirty = true;
+            presetEditorDrafts.set(getPresetDraftKey(chatId, modeKey), {
+                content: editorSession.content,
+                isExtend: editorSession.isExtend,
+                dirty: true,
+            });
 
-            notes[modeKey] = {
-                ...normalizeModePreset(notes[modeKey]),
-                content: current.content || '',
-                isExtend: !!current.isExtend,
-                updatedAt: Date.now(),
-            };
-
-            setModeNotes(notes);
-
-            const currentMode = getCurrentAppliedModeForChat();
-
-            if (currentMode === modeKey) {
-                rememberLastAppliedNote(chatId, modeKey, current.content || '', !!current.isExtend);
-            }
-
+            applyEditorSessionToNativeTextarea();
             renderModeSlots();
 
-            setStatus(`현재 유저노트를 ${getModeLabel(modeKey)} 프리셋에 저장했습니다.`);
-            showToast(`${getModeLabel(modeKey)}에 불러오기 완료`);
+            setStatus(`현재 서버 유저노트를 ${getModeLabel(modeKey)} 프리셋 편집기에 불러왔습니다.`);
+            showToast('현재값을 불러왔습니다. 저장하면 프리셋에만 반영됩니다.');
         } catch (err) {
             console.error('[현재 유저노트 모드 저장]', err);
             setStatus(err.message || '현재 유저노트를 불러오는 중 오류가 발생했습니다.');
@@ -2485,7 +1569,11 @@
         }
     }
 
-    async function clearModeNote(modeKey) {
+    function clearSelectedPreset() {
+        const chatId = parseChatId();
+        const textarea = findVisibleUserNoteTextarea();
+        const modeKey = editorSession?.kind === 'preset' ? editorSession.modeKey : '';
+        if (!chatId || !textarea || !modeKey) return;
         if (!confirm(`${getModeLabel(modeKey)} 프리셋을 비우시겠습니까?`)) return;
 
         const notes = getModeNotes();
@@ -2493,141 +1581,97 @@
         notes[modeKey] = {
             content: '',
             isExtend: false,
-            wrmcOocContent: '',
-            wrmcOocEnabled: false,
             updatedAt: null,
         };
 
         setModeNotes(notes);
+        editorSession.content = '';
+        editorSession.isExtend = false;
+        editorSession.dirty = false;
+        presetEditorDrafts.set(getPresetDraftKey(chatId, modeKey), {
+            content: '',
+            isExtend: false,
+            dirty: false,
+        });
 
-        const currentMode = getCurrentAppliedModeForChat();
-        const chatId = parseChatId();
-        let wrmcApplyError = null;
-
-        if (chatId && currentMode === modeKey) {
-            rememberLastAppliedNote(chatId, modeKey, '', false);
-            try {
-                await WrmcAdapter.applyPreset({
-                    chatId,
-                    mode: modeKey,
-                    content: '',
-                    enabled: false,
-                    force: true,
-                });
-            } catch (err) {
-                console.warn('[모델별 프리셋/WRMC] OOC 비활성 적용 실패', err);
-                wrmcApplyError = err;
-            }
-        }
-
+        applyEditorSessionToNativeTextarea();
         renderModeSlots();
 
-        if (wrmcApplyError) {
-            setStatus(`${getModeLabel(modeKey)} 프리셋을 비웠지만 WRMC OOC 비활성은 실패했습니다: ${wrmcApplyError.message || '현재 WRMC UI 구조를 인식하지 못했습니다.'}`);
-            showToast('프리셋 비움 · WRMC OOC 적용 실패');
-        } else {
-            setStatus(`${getModeLabel(modeKey)} 프리셋을 비웠습니다.`);
-            showToast('비우기 완료');
-        }
+        setStatus(`${getModeLabel(modeKey)} 프리셋을 비웠습니다.`);
+        showToast('비우기 완료');
     }
 
-    async function applyUserNotePreset(chatId, chatMode, preset, options = {}) {
-        if (!preset.content) {
-            setStatus(`${getModeLabel(chatMode)}에 저장된 유저노트가 없어 유저노트 자동 적용은 생략했습니다.`);
-            rememberLastAppliedNote(chatId, chatMode, '', !!preset.isExtend);
+    async function applyUserNoteByChatMode(chatId, chatMode) {
+        if (!chatId || !chatMode) return;
+
+        if (CHAT_MODES.some(mode => mode.key === chatMode)) {
+            lastDetectedChatId = chatId;
+            lastDetectedModeKey = chatMode;
+        }
+
+        const notes = getModeNotes();
+        const note = notes[chatMode];
+
+        if (!note) {
+            setStatus(`"${chatMode}" 모드는 등록되지 않은 모드입니다.`);
+            return;
+        }
+
+        if (!note.content) {
+            setStatus(`${getModeLabel(chatMode)}에 저장된 프리셋이 없어 자동 적용하지 않았습니다.`);
+            rememberLastAppliedNote(chatId, chatMode, '', !!note.isExtend);
             scheduleVisibleUserNoteUiSync();
-            return false;
+            return;
         }
 
         const token = getToken();
 
         if (!token) {
-            throw new Error('인증 토큰을 찾지 못해 유저노트를 자동 적용하지 못했습니다.');
+            setStatus('인증 토큰을 찾지 못해 자동 적용하지 못했습니다.');
+            showToast('인증 토큰을 찾지 못했습니다.');
+            return;
         }
 
-        const applyKey = JSON.stringify([
-            chatId,
-            chatMode,
-            preset.content,
-            !!preset.isExtend,
-        ]);
+        const applyKey = `${chatId}:${chatMode}`;
         const now = Date.now();
 
-        if (
-            !options.force &&
-            lastAutoAppliedModeKey === applyKey &&
-            now - lastAutoApplyAt < 2500
-        ) {
-            return false;
+        if (lastAutoAppliedModeKey === applyKey && now - lastAutoApplyAt < 2500) {
+            return;
         }
 
         lastAutoAppliedModeKey = applyKey;
         lastAutoApplyAt = now;
 
-        setStatus(`${getModeLabel(chatMode)} 프리셋을 현재 채팅방 유저노트에 자동 적용하는 중입니다...`);
-        await patchUserNote(chatId, preset.content, !!preset.isExtend, chatMode);
-
-        rememberLastAppliedNote(chatId, chatMode, preset.content, !!preset.isExtend);
-        scheduleVisibleUserNoteUiSync();
-
-        setStatus(`${getModeLabel(chatMode)} 프리셋을 현재 채팅방 유저노트에 자동 적용했습니다.`);
-        showToast(`${getModeLabel(chatMode)} 자동 적용 완료`);
-        return true;
-    }
-
-    async function applyPresetByChatMode(chatId, chatMode, options = {}) {
-        if (!chatId || !chatMode) return;
-
-        const currentChatId = parseChatId();
-        if (currentChatId && String(currentChatId) !== String(chatId)) {
-            console.log('[모델별 프리셋] 채팅방이 바뀌어 프리셋 적용을 생략했습니다.', {
-                eventChatId: chatId,
-                currentChatId,
-                chatMode,
-            });
-            return;
-        }
-
-        rememberDetectedChatMode(String(chatId), String(chatMode));
-
-        const preset = getModePreset(getModeNotes(), chatMode);
-        if (!preset) {
-            console.warn(`[모델별 프리셋] 알 수 없는 chat_mode 감지: ${chatMode}`);
-            setStatus(`알 수 없는 chat_mode 감지: ${chatMode} (자동 적용 생략)`);
-            return;
-        }
-
-        let userNoteError = null;
-        let wrmcError = null;
-
         try {
-            await applyUserNotePreset(chatId, chatMode, preset, options);
-        } catch (err) {
-            console.error('[모델별 프리셋/유저노트] 자동 적용 실패', err);
-            setStatus(err.message || '모델별 유저노트 자동 적용 중 오류가 발생했습니다.');
-            showToast('유저노트 자동 적용 실패');
-            userNoteError = err;
-        }
+            setStatus(`${getModeLabel(chatMode)} 프리셋을 현재 채팅방 유저노트에 자동 적용하는 중입니다...`);
 
-        try {
-            await WrmcAdapter.applyPreset({
+            await patchUserNote(chatId, note.content, !!note.isExtend, chatMode);
+
+            rememberLastAppliedNote(chatId, chatMode, note.content, !!note.isExtend);
+            currentServerUserNote = {
                 chatId,
-                mode: chatMode,
-                content: preset.wrmcOocContent,
-                enabled: preset.wrmcOocEnabled,
-                force: !!options.force,
-            });
+                content: note.content,
+                isExtend: !!note.isExtend,
+                fetchedAt: Date.now(),
+            };
+
+            if (editorSession?.chatId === chatId && editorSession.kind === 'current' && !editorSession.dirty) {
+                editorSession.content = note.content;
+                editorSession.isExtend = !!note.isExtend;
+                editorSession.loading = false;
+                applyEditorSessionToNativeTextarea();
+            }
+
+            renderModeSlots();
+            scheduleVisibleUserNoteUiSync();
+
+            setStatus(`${getModeLabel(chatMode)} 프리셋을 현재 채팅방 유저노트에 자동 적용했습니다.`);
+            showToast(`${getModeLabel(chatMode)} 자동 적용 완료`);
         } catch (err) {
-            console.warn('[모델별 프리셋/WRMC] OOC 자동 적용 실패', err);
-            setStatus(`WRMC OOC 자동 적용 실패: ${err.message || '현재 WRMC UI 구조를 인식하지 못했습니다.'}`);
-            wrmcError = err;
+            console.error('[채팅 모드 유저노트 자동 적용]', err);
+            setStatus(err.message || '채팅 모드별 유저노트 자동 적용 중 오류가 발생했습니다.');
+            showToast('자동 적용 실패');
         }
-
-        return { userNoteError, wrmcError };
-    }
-
-    async function applyUserNoteByChatMode(chatId, chatMode, options = {}) {
-        return applyPresetByChatMode(chatId, chatMode, options);
     }
 
     function exportModeNotes() {
@@ -2642,7 +1686,7 @@
         const notes = getModeNotes();
 
         const payload = {
-            version: 2,
+            version: 1,
             exportedAt: new Date().toISOString(),
             type: 'crack_chat_room_mode_user_notes',
             sourceChatId: chatId,
@@ -2716,10 +1760,6 @@
                         ? imported[mode.key].content
                         : '',
                     isExtend: !!imported[mode.key].isExtend,
-                    wrmcOocContent: typeof imported[mode.key].wrmcOocContent === 'string'
-                        ? imported[mode.key].wrmcOocContent
-                        : '',
-                    wrmcOocEnabled: !!imported[mode.key].wrmcOocEnabled,
                     updatedAt: imported[mode.key].updatedAt || Date.now(),
                 };
             }
@@ -2727,102 +1767,19 @@
 
         setModeNotes(nextNotes);
 
-        const currentMode = getCurrentAppliedModeForChat();
-
-        if (currentMode && nextNotes[currentMode]) {
-            rememberLastAppliedNote(
-                chatId,
-                currentMode,
-                nextNotes[currentMode].content || '',
-                !!nextNotes[currentMode].isExtend
-            );
+        if (editorSession?.chatId === chatId && editorSession.kind === 'preset') {
+            const importedNote = nextNotes[editorSession.modeKey] || { content: '', isExtend: false };
+            presetEditorDrafts.delete(getPresetDraftKey(chatId, editorSession.modeKey));
+            editorSession.content = importedNote.content || '';
+            editorSession.isExtend = !!importedNote.isExtend;
+            editorSession.dirty = false;
+            applyEditorSessionToNativeTextarea();
         }
 
         renderModeSlots();
 
         setStatus('현재 채팅방의 모드별 프리셋을 가져왔습니다.');
         showToast('현재 채팅방 프리셋 가져오기 완료');
-    }
-
-    function attachDrag(btn) {
-        let isDragging = false;
-        let hasDragged = false;
-        let pressTimer = null;
-        let startX = 0;
-        let startY = 0;
-        let initialLeft = 0;
-        let initialTop = 0;
-
-        function startDrag(e) {
-            hasDragged = false;
-
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-            const rect = btn.getBoundingClientRect();
-
-            startX = clientX;
-            startY = clientY;
-            initialLeft = rect.left;
-            initialTop = rect.top;
-
-            pressTimer = setTimeout(() => {
-                isDragging = true;
-                btn.classList.add('dragging');
-            }, 320);
-        }
-
-        function moveDrag(e) {
-            if (!isDragging) return;
-
-            e.preventDefault();
-            hasDragged = true;
-
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-            let newLeft = initialLeft + (clientX - startX);
-            let newTop = initialTop + (clientY - startY);
-
-            const maxX = window.innerWidth - btn.offsetWidth;
-            const maxY = window.innerHeight - btn.offsetHeight;
-
-            newLeft = Math.max(0, Math.min(newLeft, maxX));
-            newTop = Math.max(0, Math.min(newTop, maxY));
-
-            btn.style.left = `${newLeft}px`;
-            btn.style.top = `${newTop}px`;
-            btn.style.right = 'auto';
-            btn.style.bottom = 'auto';
-        }
-
-        function endDrag() {
-            clearTimeout(pressTimer);
-
-            if (isDragging) {
-                isDragging = false;
-                btn.classList.remove('dragging');
-
-                GM_setValue(BTN_POS_KEY_X, parseInt(btn.style.left, 10));
-                GM_setValue(BTN_POS_KEY_Y, parseInt(btn.style.top, 10));
-            }
-
-            if (hasDragged) {
-                btn.dataset.dragged = '1';
-
-                setTimeout(() => {
-                    btn.dataset.dragged = '0';
-                }, 100);
-            }
-        }
-
-        btn.addEventListener('touchstart', startDrag, { passive: false });
-        btn.addEventListener('touchmove', moveDrag, { passive: false });
-        btn.addEventListener('touchend', endDrag);
-
-        btn.addEventListener('mousedown', startDrag);
-        document.addEventListener('mousemove', moveDrag);
-        document.addEventListener('mouseup', endDrag);
     }
 
     function init() {
@@ -2836,7 +1793,8 @@
             return;
         }
 
-        renderModeSlots();
+        const textarea = findVisibleUserNoteTextarea();
+        if (textarea) scheduleVisibleUserNoteUiSync();
     }
 
     let lastUrl = location.href;
@@ -2844,7 +1802,7 @@
     const observer = new MutationObserver(() => {
         if (!document.body) return;
 
-        if (!document.getElementById('mun-toggle-btn')) {
+        if (!document.getElementById('mun-toast')) {
             init();
         }
 
@@ -2863,6 +1821,9 @@
         if (!userNoteTextarea && lastSeenUserNoteTextarea) {
             lastSeenUserNoteTextarea = null;
             lastSyncedUserNoteKey = '';
+            editorSession = null;
+            currentServerUserNote = null;
+            currentEditorDraft = null;
             clearEditingUserNoteDraft('modal closed without save');
         }
 
@@ -2872,15 +1833,17 @@
             lastAutoAppliedModeKey = '';
             lastAutoApplyAt = 0;
             lastDetectedChatId = '';
-            lastDetectedChatMode = '';
+            lastDetectedModeKey = '';
             lastSeenUserNoteTextarea = null;
             lastSyncedUserNoteKey = '';
             pendingUserNotePatchMode = null;
+            editorSession = null;
+            currentServerUserNote = null;
+            currentEditorDraft = null;
             clearEditingUserNoteDraft('url changed');
 
             setTimeout(() => {
                 init();
-                renderModeSlots();
                 setStatus('채팅방이 변경되어 해당 채팅방의 모드별 프리셋을 불러왔습니다.');
             }, 500);
         }
