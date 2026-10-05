@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.4
+// @version      1.5.5
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -115,7 +115,6 @@
         const SYNC_TIMEOUT_MS = 45000;
         const INJECTION_WAIT_MS = 30000;
         const INJECTION_POLL_MS = 400;
-        const POLICY_SETTLE_MS = 1200;
 
         let applyQueue = Promise.resolve();
         let lastApplyKey = '';
@@ -301,42 +300,30 @@
             );
         }
 
+        function extraPolicyState(extraView) {
+            return findExtraPolicyButton(extraView).getAttribute('aria-pressed') === 'true';
+        }
+
         /**
          * 기타·OOC 그룹 전체 주입 정책(room.injectionPolicy.extraEvery / UI pol.extra)을 공식 칩으로 켠다.
          * 끄는 일은 하지 않는다: 사용자의 다른 기타·OOC 슬롯도 같은 정책을 공유한다.
-         * WRMC는 값을 동기적으로 바꾼 뒤 saveRoom을 비동기로 끝내고, 저장 실패 시 값을 되돌리며 오류 토스트를 띄운다.
+         * WRMC flip은 setKey()의 go()를 await하지 않으므로 여기서는 "요청"만 확인한다.
+         * 저장 완료는 이후 flushWrmcToggleWrites()의 공식 편집 저장이 끝나는 시점으로 판단한다.
          */
-        async function ensureExtraPolicyEnabled(extraView, chatId) {
-            const button = findExtraPolicyButton(extraView);
-            if (button.getAttribute('aria-pressed') === 'true') return { view: extraView, changed: false };
+        async function ensureExtraPolicyEnabled(extraView, chatId, knownToasts) {
+            if (extraPolicyState(extraView)) return { view: extraView, changed: false };
 
             assertChat(chatId, '기타·OOC 주입 정책 변경 전');
-            const knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-            const readPolicy = () => {
+            click(findExtraPolicyButton(extraView), 'WRMC 기타·OOC 주입 정책 켜기');
+            console.log('[WRMC OOC] policy toggle requested', { chatId, from: false, to: true });
+            const view = await waitFor(() => {
                 const failure = newErrorToast(knownToasts);
                 if (failure) {
                     throw new Error(`WRMC 기타·OOC 주입 정책 저장 실패: ${String(failure.textContent || '').trim()}`);
                 }
-                const view = document.querySelector(EXTRA_VIEW_SELECTOR);
-                return view ? findExtraPolicyButton(view).getAttribute('aria-pressed') === 'true' : false;
-            };
-
-            click(button, 'WRMC 기타·OOC 주입 정책 켜기');
-            await waitFor(readPolicy, '기타·OOC 주입 정책 ON 반영');
-
-            // 이 저장 경로는 "저장 중" 표시가 없으므로, 되돌림/오류 토스트 없이 ON이 유지되는지 지켜본다.
-            const settleUntil = Date.now() + POLICY_SETTLE_MS;
-            while (Date.now() < settleUntil) {
-                await delay(INJECTION_POLL_MS);
-                if (!readPolicy()) throw new Error('WRMC 기타·OOC 주입 정책이 저장되지 않고 OFF로 되돌아갔습니다.');
-            }
-
-            // 기억 탭을 다시 열어 room.injectionPolicy에서 새로 그린 화면에서도 ON인지 확인한다.
-            const view = await openExtraView(chatId);
-            if (findExtraPolicyButton(view).getAttribute('aria-pressed') !== 'true' || newErrorToast(knownToasts)) {
-                throw new Error('WRMC 기타·OOC 주입 정책 ON을 확인하지 못했습니다.');
-            }
-            console.log('[모델별 프리셋/WRMC] 기타·OOC 그룹 주입 정책(pol.extra)을 ON으로 변경했습니다.', { chatId });
+                const current = document.querySelector(EXTRA_VIEW_SELECTOR);
+                return current && extraPolicyState(current) ? current : null;
+            }, '기타·OOC 주입 정책 ON 표시');
             return { view, changed: true };
         }
 
@@ -352,6 +339,7 @@
             return { slot: null, editor, created: true };
         }
 
+        /** content === null이면 편집창에 WRMC가 불러온 저장본을 그대로 다시 저장한다(write barrier 용). */
         async function setSlotContent(slotState, content, chatId, force) {
             if (slotState.slot && !force && slotState.slot.content === content) return slotState.slot;
 
@@ -367,11 +355,16 @@
             const saveButton = requireUnique(editor, 'button[data-act="eSave"][data-arg]', '예약 슬롯 저장 버튼');
 
             setNativeValue(titleInput, WRMC_RESERVED_SLOT_TITLE);
-            setNativeValue(contentInput, content);
+            if (content !== null) setNativeValue(contentInput, content);
             assertChat(chatId, '예약 슬롯 저장 전');
+            const knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
             click(saveButton, 'WRMC 예약 슬롯 저장');
-            // WRMC 편집창은 저장 + 현재 주입 동기화(WUISyncMemoryEdit)가 끝난 뒤에 닫힌다.
-            await waitFor(() => !editor.isConnected, '예약 슬롯 저장 완료', SYNC_TIMEOUT_MS);
+            // WRMC 편집창은 saveRoom + 현재 주입 동기화(WUISyncMemoryEdit)가 끝난 뒤에 닫힌다.
+            await waitFor(() => {
+                const failure = newErrorToast(knownToasts);
+                if (failure) throw new Error(`WRMC 저장 실패(토글 또는 예약 슬롯): ${String(failure.textContent || '').trim()}`);
+                return !editor.isConnected;
+            }, '예약 슬롯 저장 완료', SYNC_TIMEOUT_MS);
 
             const extraView = await waitFor(
                 () => document.querySelector(EXTRA_VIEW_SELECTOR),
@@ -382,20 +375,56 @@
             return slot;
         }
 
+        /**
+         * WRMC flip은 aria-pressed를 먼저 바꾸고 saveRoom → WUISyncMemoryEdit는 await되지 않은 go()에서 끝낸다.
+         * 여기서는 토글 "요청"과 화면 반영만 확인한다. 저장 완료는 flushWrmcToggleWrites()가 보장한다.
+         */
         async function setSlotEnabled(slot, enabled, chatId) {
             const current = slot.enableButton.getAttribute('aria-pressed') === 'true';
             if (current === enabled) return false;
 
-            assertChat(chatId, '예약 슬롯 활성 상태 저장 전');
+            assertChat(chatId, '예약 슬롯 활성 상태 변경 전');
             click(slot.enableButton, 'WRMC 예약 슬롯 활성 상태 변경');
+            console.log('[WRMC OOC] slot enabled toggle requested', { chatId, slotId: slot.slotId, from: current, to: enabled });
             await waitFor(() => {
                 const view = document.querySelector(EXTRA_VIEW_SELECTOR);
                 const refreshed = view ? findModelOocSlot(view) : null;
                 return refreshed?.enableButton.getAttribute('aria-pressed') === String(enabled);
-            }, '예약 슬롯 활성 상태 반영');
-            await delay(350);
-            assertChat(chatId, '예약 슬롯 활성 상태 저장 후');
+            }, '예약 슬롯 활성 상태 표시');
+            assertChat(chatId, '예약 슬롯 활성 상태 변경 후');
             return true;
+        }
+
+        /**
+         * WRMC 토글 저장 flush barrier.
+         * 공식 xEdit → eSave 편집 저장은 saveRoom()과 WUISyncMemoryEdit()를 await한 뒤 편집창을 닫는다.
+         * saveRoom()은 같은 방의 쓰기를 storageWrites 체인으로 직렬화하고, carrier sync도 withCarrierOperation
+         * 체인으로 직렬화하므로, 이 저장이 끝났다면 앞서 시작된 pol.extra / extra.enabled 토글의
+         * saveRoom()과 주입 sync도 이미 끝난 상태다. 본문이 같아도 반드시 저장한다(force).
+         * content === null이면 편집창의 저장본을 그대로 저장한다(OFF 프리셋에서 본문을 건드리지 않기 위해).
+         */
+        async function flushWrmcToggleWrites(content, chatId) {
+            console.log('[WRMC OOC] write barrier start', { chatId });
+            const extraView = await openExtraView(chatId);
+            const slot = findModelOocSlot(extraView);
+            if (!slot) {
+                throw new Error('WRMC 토글 저장 확인 전에 모델별 OOC 예약 슬롯을 찾지 못했습니다.');
+            }
+            const saved = await setSlotContent({ slot, editor: null, created: false }, content, chatId, true);
+            console.log('[WRMC OOC] write barrier completed', { chatId, slotId: saved.slotId });
+            return saved;
+        }
+
+        /** barrier 뒤 기타·OOC 화면을 새로 열어 room 상태에서 다시 그린 UI로 최종 상태를 확인한다. */
+        async function readPostBarrierState(chatId) {
+            const extraView = await openExtraView(chatId);
+            const slot = findModelOocSlot(extraView);
+            return {
+                slot,
+                policy: extraPolicyState(extraView),
+                slotEnabled: slot ? slot.enableButton.getAttribute('aria-pressed') === 'true' : false,
+                content: slot ? slot.content : null,
+            };
         }
 
         function isInjectionActive() {
@@ -486,8 +515,9 @@
             );
 
             try {
-                const cards = [...dialog.querySelectorAll('details.m3-card[data-key^="k-pv-"]')]
-                    .filter(card => previewCardTitle(card) === WRMC_RESERVED_SLOT_TITLE);
+                const allCards = [...dialog.querySelectorAll('details.m3-card[data-key^="k-pv-"]')];
+                const cardTitles = allCards.map(previewCardTitle);
+                const cards = allCards.filter(card => previewCardTitle(card) === WRMC_RESERVED_SLOT_TITLE);
                 if (cards.length > 1) {
                     throw new Error('WRMC OOC 적용 중단: 현재 주입에 예약 슬롯이 여러 개입니다.');
                 }
@@ -500,7 +530,7 @@
                 );
                 try {
                     const fullText = viewer.querySelector('pre.m3-block.tall')?.textContent ?? '';
-                    return { cardContent, fullText };
+                    return { cardContent, fullText, cardTitles };
                 } finally {
                     await closeDialog(viewer, '주입 전체 원문');
                 }
@@ -556,8 +586,10 @@
                 const reservedActive = panel.activeRows.length > 0;
 
                 if (settled || timedOut || syncFailed) {
+                    // 진단 전용 필드: 결정에는 쓰지 않는다.
+                    const diagnostics = { rowFound: panel.rows.length > 0, previewCardFound: null, fullTextFound: null, cardTitles: null };
                     if (!rowsReady) {
-                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false, reservedActive };
+                        return { active: true, reflected: false, quickExcluded: false, carrierVerified: false, reservedActive, ...diagnostics };
                     }
                     const preview = await readInjectionPreview(chatId);
                     return {
@@ -566,6 +598,10 @@
                         quickExcluded: false,
                         carrierVerified: settled,
                         reservedActive,
+                        ...diagnostics,
+                        previewCardFound: preview.cardContent !== null,
+                        fullTextFound: preview.fullText.includes(reservedSectionHeading()),
+                        cardTitles: preview.cardTitles,
                     };
                 }
                 await delay(INJECTION_POLL_MS);
@@ -781,6 +817,52 @@
             }
         }
 
+        function logInjectionVerify(label, injection) {
+            console.log(`[WRMC OOC] ${label}`, {
+                active: injection.active,
+                reflected: injection.reflected,
+                rowFound: injection.rowFound ?? null,
+                previewCardFound: injection.previewCardFound ?? null,
+                fullTextFound: injection.fullTextFound ?? null,
+                carrierVerified: injection.carrierVerified,
+                quickExcluded: injection.quickExcluded,
+            });
+        }
+
+        /** 실패 시 원인 판별용 상태를 공식 UI에서 다시 읽어 console에 남긴다. 추측 수정은 하지 않는다. */
+        async function reportInjectionFailure(chatId, injection) {
+            const report = {
+                reservedSlotId: null,
+                reservedSlotTitle: null,
+                reservedSlotVisibleContent: null,
+                policyExtra: null,
+                slotEnabled: null,
+                injectionActive: isInjectionActive(),
+                injectionRowFound: injection?.rowFound ?? null,
+                previewCardTitles: injection?.cardTitles ?? null,
+                fullTextHasReservedTitle: injection?.fullTextFound ?? null,
+            };
+            try {
+                const state = await readPostBarrierState(chatId);
+                report.reservedSlotId = state.slot?.slotId ?? null;
+                report.reservedSlotTitle = state.slot ? WRMC_RESERVED_SLOT_TITLE : null;
+                report.reservedSlotVisibleContent = state.content;
+                report.policyExtra = state.policy;
+                report.slotEnabled = state.slotEnabled;
+                report.injectionActive = isInjectionActive();
+                if (report.injectionActive) {
+                    report.injectionRowFound = readInjectionPanel(await openInjectionView(chatId)).rows.length > 0;
+                    const preview = await readInjectionPreview(chatId);
+                    report.previewCardTitles = preview.cardTitles;
+                    report.fullTextHasReservedTitle = preview.fullText.includes(reservedSectionHeading());
+                }
+            } catch (error) {
+                report.diagnosticError = String(error?.message || error);
+            }
+            console.error('[WRMC OOC] failure diagnostics', report);
+            return report;
+        }
+
         async function applyInternal(request) {
             if (!isAvailable()) return { applied: false, reason: 'not-installed' };
 
@@ -790,17 +872,20 @@
 
             try {
                 assertChat(request.chatId, 'WRMC OOC 적용 직전');
+                // 토글/저장 중 WRMC가 띄우는 오류·경고 토스트를 구분하기 위한 기준점.
+                const toggleToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
                 let extraView = await openExtraView(request.chatId);
+
+                // 1. 그룹 정책(pol.extra): 예약 슬롯만 켜도 OFF면 WRMC가 기타·OOC 전체를 주입하지 않는다.
                 let policyChanged = false;
                 if (enabled) {
-                    // 예약 슬롯만 켜도 그룹 정책(pol.extra)이 OFF면 WRMC가 기타·OOC 전체를 주입하지 않는다.
-                    // pol.extra 저장 sync는 WRMC carrier 작업 큐에서 이후 슬롯 저장 sync보다 먼저 처리된다.
-                    const policy = await ensureExtraPolicyEnabled(extraView, request.chatId);
+                    const policy = await ensureExtraPolicyEnabled(extraView, request.chatId, toggleToasts);
                     extraView = policy.view;
                     policyChanged = policy.changed;
                 }
-                let slotState = await ensureModelOocSlot(extraView, request.chatId);
 
+                // 2. 예약 슬롯 생성/본문 저장 (공식 편집 저장 — editor가 닫힐 때까지 await)
+                let slotState = await ensureModelOocSlot(extraView, request.chatId);
                 if (slotState.created || enabled) {
                     slotState = {
                         slot: await setSlotContent(slotState, content, request.chatId, !!request.force),
@@ -809,22 +894,62 @@
                     };
                 }
 
+                // 3. 예약 슬롯 extra.enabled 토글 요청 (WRMC flip은 저장 완료를 반환하지 않음)
                 assertChat(request.chatId, '예약 슬롯 최종 적용 전');
-                // 토글의 비동기 주입 재구성이 실패하면 WRMC가 새 경고 토스트를 띄운다.
-                let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
-                await setSlotEnabled(slotState.slot, enabled, request.chatId);
+                const enabledChanged = await setSlotEnabled(slotState.slot, enabled, request.chatId);
 
+                // 4~5. 토글 저장 flush barrier: 공식 편집 저장이 끝나야 앞선 토글의 saveRoom/sync도 끝난 것이다.
+                if (policyChanged || enabledChanged) {
+                    await flushWrmcToggleWrites(enabled ? content : null, request.chatId);
+                    const toggleFailure = newErrorToast(toggleToasts);
+                    if (toggleFailure) {
+                        throw new Error(`WRMC 토글 저장 실패: ${String(toggleFailure.textContent || '').trim()}`);
+                    }
+                }
+
+                // 6. 기타·OOC 화면을 새로 열어 room 상태로 다시 그린 최종 UI를 재검증한다.
+                const postState = await readPostBarrierState(request.chatId);
+                console.log('[WRMC OOC] post-barrier state:', {
+                    policy: postState.policy,
+                    slotEnabled: postState.slotEnabled,
+                    contentLength: postState.content === null ? null : countChars(postState.content),
+                    barrier: policyChanged || enabledChanged,
+                });
+                const stateProblem = !postState.slot
+                    ? '예약 슬롯 없음'
+                    : enabled && !postState.policy
+                        ? 'pol.extra OFF'
+                        : postState.slotEnabled !== enabled
+                            ? `extra.enabled=${postState.slotEnabled}`
+                            : enabled && postState.content !== content
+                                ? '예약 슬롯 본문 불일치'
+                                : '';
+                if (stateProblem) {
+                    const diagnostics = await reportInjectionFailure(request.chatId, null);
+                    const error = new Error(`WRMC 저장 후 상태 확인 실패(${stateProblem}). 주입 검증/재시작을 진행하지 않았습니다.`);
+                    error.diagnostics = diagnostics;
+                    throw error;
+                }
+                slotState = { ...slotState, slot: postState.slot };
+
+                // 7. 현재 주입 검증
+                let knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
                 let injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
+                logInjectionVerify('injection verify result:', injection);
                 if (injection.active && !injection.reflected && enabled && injection.reservedActive) {
                     // 예약 슬롯은 현재 주입에 있고 본문만 이전 값: 공식 편집 저장 sync를 한 번만 다시 쓴다.
                     knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
                     await refreshCurrentInjectionViaSlotSave(content, request.chatId);
                     injection = await verifyCurrentInjection(content, enabled, request.chatId, knownToasts);
+                    logInjectionVerify('injection verify result (after re-save):', injection);
                 }
 
+                // 8~9. barrier 이후에만 release → arm fallback
                 let restart = null;
                 let quickRestore = null;
-                if (injection.active && !injection.reflected) {
+                const restartRequired = injection.active && !injection.reflected;
+                console.log('[WRMC OOC] restart required=' + restartRequired, { chatId: request.chatId });
+                if (restartRequired) {
                     // 예약 슬롯이 현재 주입 세션에 없거나(enabled), 꺼졌는데 남아 있음(disabled):
                     // 저장·토글 sync로는 고쳐지지 않으므로 공식 [주입 해제] → [주입 시작]으로 새 snapshot을 만든다.
                     restart = await restartInjectionForReservedSlot(
@@ -835,6 +960,12 @@
                     injection = restart.armed
                         ? await verifyCurrentInjection(content, enabled, request.chatId)
                         : { active: false, reflected: true, quickExcluded: false, carrierVerified: false };
+                    console.log('[WRMC OOC] post-restart verify=' + (injection.active ? injection.reflected : 'inactive'), {
+                        armed: restart.armed,
+                        rowFound: injection.rowFound,
+                        previewCardFound: injection.previewCardFound,
+                        fullTextFound: injection.fullTextFound,
+                    });
                     if (injection.active && injection.reflected && restart.preserved.length) {
                         quickRestore = await restoreQuickExclusions(request.chatId, restart.preserved);
                         if (quickRestore.restored.length) {
@@ -846,9 +977,12 @@
                     }
                 }
                 if (injection.active && !injection.reflected) {
-                    throw new Error(enabled
+                    const diagnostics = await reportInjectionFailure(request.chatId, injection);
+                    const error = new Error(enabled
                         ? 'WRMC OOC 저장은 완료했지만 주입확인에 예약 OOC 제목·본문이 나타나지 않았습니다.'
                         : 'WRMC OOC 주입 OFF는 저장했지만 주입확인에서 예약 OOC가 제거되지 않았습니다.');
+                    error.diagnostics = diagnostics;
+                    throw error;
                 }
 
                 const message = !injection.active
