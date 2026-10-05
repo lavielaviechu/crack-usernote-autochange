@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      1.5.3
+// @version      1.5.4
 // @description  crack.wrtn.ai 채팅방별로 채팅 모드 유저노트와 WRMC OOC를 저장하고, 채팅 모드 변경 시 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -115,6 +115,7 @@
         const SYNC_TIMEOUT_MS = 45000;
         const INJECTION_WAIT_MS = 30000;
         const INJECTION_POLL_MS = 400;
+        const POLICY_SETTLE_MS = 1200;
 
         let applyQueue = Promise.resolve();
         let lastApplyKey = '';
@@ -290,6 +291,53 @@
                     ));
                 return dialogs.length === 1 ? dialogs[0] : null;
             }, '기타·OOC 편집창');
+        }
+
+        function findExtraPolicyButton(extraView) {
+            return requireUnique(
+                extraView,
+                'button[data-act="flip"][data-arg="pol.extra"]',
+                '기타·OOC 그룹 주입 정책(pol.extra) 버튼'
+            );
+        }
+
+        /**
+         * 기타·OOC 그룹 전체 주입 정책(room.injectionPolicy.extraEvery / UI pol.extra)을 공식 칩으로 켠다.
+         * 끄는 일은 하지 않는다: 사용자의 다른 기타·OOC 슬롯도 같은 정책을 공유한다.
+         * WRMC는 값을 동기적으로 바꾼 뒤 saveRoom을 비동기로 끝내고, 저장 실패 시 값을 되돌리며 오류 토스트를 띄운다.
+         */
+        async function ensureExtraPolicyEnabled(extraView, chatId) {
+            const button = findExtraPolicyButton(extraView);
+            if (button.getAttribute('aria-pressed') === 'true') return { view: extraView, changed: false };
+
+            assertChat(chatId, '기타·OOC 주입 정책 변경 전');
+            const knownToasts = new Set(document.querySelectorAll(TOAST_SELECTOR));
+            const readPolicy = () => {
+                const failure = newErrorToast(knownToasts);
+                if (failure) {
+                    throw new Error(`WRMC 기타·OOC 주입 정책 저장 실패: ${String(failure.textContent || '').trim()}`);
+                }
+                const view = document.querySelector(EXTRA_VIEW_SELECTOR);
+                return view ? findExtraPolicyButton(view).getAttribute('aria-pressed') === 'true' : false;
+            };
+
+            click(button, 'WRMC 기타·OOC 주입 정책 켜기');
+            await waitFor(readPolicy, '기타·OOC 주입 정책 ON 반영');
+
+            // 이 저장 경로는 "저장 중" 표시가 없으므로, 되돌림/오류 토스트 없이 ON이 유지되는지 지켜본다.
+            const settleUntil = Date.now() + POLICY_SETTLE_MS;
+            while (Date.now() < settleUntil) {
+                await delay(INJECTION_POLL_MS);
+                if (!readPolicy()) throw new Error('WRMC 기타·OOC 주입 정책이 저장되지 않고 OFF로 되돌아갔습니다.');
+            }
+
+            // 기억 탭을 다시 열어 room.injectionPolicy에서 새로 그린 화면에서도 ON인지 확인한다.
+            const view = await openExtraView(chatId);
+            if (findExtraPolicyButton(view).getAttribute('aria-pressed') !== 'true' || newErrorToast(knownToasts)) {
+                throw new Error('WRMC 기타·OOC 주입 정책 ON을 확인하지 못했습니다.');
+            }
+            console.log('[모델별 프리셋/WRMC] 기타·OOC 그룹 주입 정책(pol.extra)을 ON으로 변경했습니다.', { chatId });
+            return { view, changed: true };
         }
 
         async function ensureModelOocSlot(extraView, chatId) {
@@ -742,7 +790,15 @@
 
             try {
                 assertChat(request.chatId, 'WRMC OOC 적용 직전');
-                const extraView = await openExtraView(request.chatId);
+                let extraView = await openExtraView(request.chatId);
+                let policyChanged = false;
+                if (enabled) {
+                    // 예약 슬롯만 켜도 그룹 정책(pol.extra)이 OFF면 WRMC가 기타·OOC 전체를 주입하지 않는다.
+                    // pol.extra 저장 sync는 WRMC carrier 작업 큐에서 이후 슬롯 저장 sync보다 먼저 처리된다.
+                    const policy = await ensureExtraPolicyEnabled(extraView, request.chatId);
+                    extraView = policy.view;
+                    policyChanged = policy.changed;
+                }
                 let slotState = await ensureModelOocSlot(extraView, request.chatId);
 
                 if (slotState.created || enabled) {
@@ -812,6 +868,7 @@
                     enabled,
                     length: countChars(content),
                     runtime: initialState.runtime,
+                    extraPolicyChanged: policyChanged,
                     injectionRestarted: !!restart,
                     quickRestore,
                 });
@@ -822,6 +879,7 @@
                     injectionReflected: injection.reflected,
                     carrierVerified: injection.carrierVerified,
                     quickExcluded: injection.quickExcluded,
+                    extraPolicyChanged: policyChanged,
                     injectionRestarted: !!restart,
                     quickRestore,
                 };
