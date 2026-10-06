@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.1.1
 // @description  Crack 유저노트 창에서 모델 프리셋을 자동 저장하고, 채팅 모드 변경 시 서버에 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -31,8 +31,12 @@
 
     let lastAutoAppliedModeKey = '';
     let lastAutoApplyAt = 0;
+    // Detection is retained for native-save preset synchronization. The active
+    // indicator uses the separate successful-PATCH state below.
     let lastDetectedChatId = '';
     let lastDetectedModeKey = '';
+    let lastSuccessfulUserNoteChatId = '';
+    let lastSuccessfulUserNoteModeKey = '';
 
     let lastAppliedUserNoteContent = '';
     let lastAppliedUserNoteIsExtend = false;
@@ -269,8 +273,8 @@
 
         if (!chatId) return '';
 
-        if (lastDetectedChatId === chatId && lastDetectedModeKey) {
-            return lastDetectedModeKey;
+        if (lastSuccessfulUserNoteChatId === chatId && lastSuccessfulUserNoteModeKey) {
+            return lastSuccessfulUserNoteModeKey;
         }
 
         if (
@@ -287,6 +291,16 @@
         }
 
         return '';
+    }
+
+    function getDetectedModeForChat() {
+        const chatId = parseChatId();
+
+        if (chatId && lastDetectedChatId === chatId && lastDetectedModeKey) {
+            return lastDetectedModeKey;
+        }
+
+        return getCurrentAppliedModeForChat();
     }
 
     function getPendingPatchMode(chatId, patchedUserNote) {
@@ -509,7 +523,7 @@
         const modeKey =
             modeKeyOverride ||
             getPendingPatchMode(chatId, { content, isExtend }) ||
-            getCurrentAppliedModeForChat();
+            getDetectedModeForChat();
 
         if (!modeKey || !CHAT_MODES.some(mode => mode.key === modeKey)) {
             return;
@@ -525,6 +539,8 @@
         };
 
         setModeNotes(notes);
+        lastSuccessfulUserNoteChatId = chatId;
+        lastSuccessfulUserNoteModeKey = modeKey;
         rememberLastAppliedNote(chatId, modeKey, content, isExtend);
         renderModeTabs();
         showToast(`${getModeShortLabel(modeKey)} 프리셋 저장됨`);
@@ -608,7 +624,6 @@
                         if (chatId && CHAT_MODES.some(mode => mode.key === chatMode)) {
                             lastDetectedChatId = chatId;
                             lastDetectedModeKey = chatMode;
-                            renderModeTabs();
                         }
 
                         console.log('[채팅모드별 유저노트 자동변경 감지]', {
@@ -1061,7 +1076,7 @@
                     type="button"
                     class="mun-chip${selected ? ' is-selected' : ''}${active ? ' is-active' : ''}"
                     data-mun-mode="${escapeHtml(mode.key)}"
-                    title="${escapeHtml(mode.label)}${active ? ' · 현재 모델' : ''}"
+                    title="${escapeHtml(mode.label)}${active ? ' · 유저노트 적용 성공' : ''}"
                     aria-pressed="${selected ? 'true' : 'false'}"
                 >${escapeHtml(mode.shortLabel || mode.label)}</button>
             `;
@@ -1146,11 +1161,6 @@
             flushPresetAutoSave(false);
         }
 
-        if (CHAT_MODES.some(mode => mode.key === chatMode)) {
-            lastDetectedChatId = chatId;
-            lastDetectedModeKey = chatMode;
-        }
-
         let notes;
 
         try {
@@ -1168,8 +1178,6 @@
         }
 
         if (!note.content) {
-            rememberLastAppliedNote(chatId, chatMode, '', !!note.isExtend);
-            renderModeTabs();
             return;
         }
 
@@ -1193,6 +1201,8 @@
         try {
             await patchUserNote(chatId, note.content, !!note.isExtend, chatMode);
 
+            lastSuccessfulUserNoteChatId = chatId;
+            lastSuccessfulUserNoteModeKey = chatMode;
             rememberLastAppliedNote(chatId, chatMode, note.content, !!note.isExtend);
             currentServerUserNote = {
                 chatId,
@@ -1258,6 +1268,8 @@
             lastAutoApplyAt = 0;
             lastDetectedChatId = '';
             lastDetectedModeKey = '';
+            lastSuccessfulUserNoteChatId = '';
+            lastSuccessfulUserNoteModeKey = '';
             lastSeenUserNoteTextarea = null;
             pendingUserNotePatchMode = null;
             selectedPresetMode = '';
