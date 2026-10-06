@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.2.1
 // @description  Crack 유저노트 창에서 모델 프리셋을 자동 저장하고, 채팅 모드 변경 시 서버에 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -108,19 +108,18 @@
                     : !!entry && (entry.initialized === true || hasLegacyValue);
 
                 notes[mode.key] = {
-                    content: customized && typeof entry?.content === 'string'
+                    content: typeof entry?.content === 'string'
                         ? entry.content
                         : '',
-                    isExtend: customized && !!entry?.isExtend,
-                    updatedAt: customized ? entry?.updatedAt || null : null,
+                    isExtend: !!entry?.isExtend,
+                    updatedAt: entry?.updatedAt || null,
                     customized,
                 };
 
                 if (
                     !entry ||
                     !hasExplicitCustomized ||
-                    Object.prototype.hasOwnProperty.call(entry, 'initialized') ||
-                    (!customized && hasLegacyValue)
+                    Object.prototype.hasOwnProperty.call(entry, 'initialized')
                 ) {
                     needsMigration = true;
                 }
@@ -405,35 +404,41 @@
         }) || null;
     }
 
-    function getEffectiveModeNote(modeKey, notes = getModeNotes(), serverNote = currentServerUserNote) {
-        const stored = notes?.[modeKey];
-        if (!stored) return null;
+    function initializeSynchronizedPresets(serverNote, chatId = parseChatId()) {
+        const notes = getModeNotes(chatId);
+        if (!serverNote || serverNote.chatId !== chatId) return notes;
 
-        if (stored.customized) {
-            return {
-                content: stored.content || '',
-                isExtend: !!stored.isExtend,
-                customized: true,
+        let changed = false;
+        const updatedAt = Date.now();
+
+        CHAT_MODES.forEach(mode => {
+            const note = notes[mode.key];
+            if (note?.customized || note?.updatedAt) return;
+
+            notes[mode.key] = {
+                content: serverNote.content || '',
+                isExtend: !!serverNote.isExtend,
+                updatedAt,
+                customized: false,
             };
+            changed = true;
+        });
+
+        if (changed) {
+            setModeNotes(notes, chatId);
         }
 
-        if (!serverNote || serverNote.chatId !== parseChatId()) return null;
-
-        return {
-            content: serverNote.content || '',
-            isExtend: !!serverNote.isExtend,
-            customized: false,
-        };
+        return notes;
     }
 
-    async function ensureServerUserNoteAndGetPresets(chatId, forceRefresh = false) {
+    async function ensureServerUserNoteAndGetPresets(chatId) {
         if (!chatId) return getModeNotes();
 
         let serverNote = currentServerUserNote?.chatId === chatId
             ? currentServerUserNote
             : null;
 
-        if (!serverNote || forceRefresh) {
+        if (!serverNote) {
             const fetched = await fetchCurrentUserNote(chatId);
             serverNote = {
                 chatId,
@@ -444,7 +449,7 @@
             currentServerUserNote = serverNote;
         }
 
-        return getModeNotes(chatId);
+        return initializeSynchronizedPresets(serverNote, chatId);
     }
 
     async function syncVisibleUserNoteUIFromAppliedThenServer() {
@@ -480,6 +485,7 @@
                 fetchedAt: Date.now(),
             };
 
+            initializeSynchronizedPresets(currentServerUserNote, chatId);
             renderModeTabs();
 
             const presetEditor = getPresetEditor();
@@ -524,6 +530,9 @@
     function syncPatchedUserNoteToPreset(chatId, patchedUserNote, modeKeyOverride = '') {
         if (!chatId || !patchedUserNote) return;
 
+        // This path is reached only after a successful native PATCH. The fetch
+        // hook excludes userscript patchUserNote() calls via internalPatchInProgress.
+
         const currentChatId = parseChatId();
         if (currentChatId && currentChatId !== chatId) return;
 
@@ -545,32 +554,45 @@
             getPendingPatchMode(chatId, { content, isExtend }) ||
             getDetectedModeForChat();
 
-        if (!modeKey || !CHAT_MODES.some(mode => mode.key === modeKey)) {
-            return;
-        }
-
         const notes = getModeNotes();
-        const storedNote = notes[modeKey];
+        const updatedAt = Date.now();
+        let synchronized = false;
 
-        if (storedNote?.customized) {
-            notes[modeKey] = {
+        CHAT_MODES.forEach(mode => {
+            const note = notes[mode.key];
+            if (note?.customized) return;
+
+            notes[mode.key] = {
                 content,
                 isExtend,
-                updatedAt: Date.now(),
-                customized: true,
+                updatedAt,
+                customized: false,
             };
+            synchronized = true;
+        });
+
+        if (synchronized) {
             setModeNotes(notes);
         }
 
-        lastSuccessfulUserNoteChatId = chatId;
-        lastSuccessfulUserNoteModeKey = modeKey;
-        rememberLastAppliedNote(chatId, modeKey, content, isExtend);
+        const knownMode = CHAT_MODES.some(mode => mode.key === modeKey);
+        if (knownMode) {
+            lastSuccessfulUserNoteChatId = chatId;
+            lastSuccessfulUserNoteModeKey = modeKey;
+            rememberLastAppliedNote(chatId, modeKey, content, isExtend);
+        }
+
         renderModeTabs();
-        showToast(`${getModeShortLabel(modeKey)} 프리셋 저장됨`);
+        if (knownMode) {
+            showToast(`${getModeShortLabel(modeKey)} 프리셋 저장됨`);
+        }
 
         console.log('[채팅모드별 유저노트 자동변경] native PATCH 유저노트를 프리셋에 동기화했습니다.', {
             chatId,
             modeKey,
+            synchronizedModes: CHAT_MODES
+                .filter(mode => !notes[mode.key]?.customized)
+                .map(mode => mode.key),
             length: countChars(content),
             isExtend,
         });
@@ -965,7 +987,7 @@
         if (!textarea || !presetEditor || !modeKey) return;
 
         const notes = getModeNotes();
-        const note = getEffectiveModeNote(modeKey, notes);
+        const note = notes[modeKey];
         if (!note) return;
 
         const stableHeight = getStableEditorHeight(textarea);
@@ -1004,15 +1026,12 @@
             updatedAt: null,
             customized: false,
         };
-        const inherited = getEffectiveModeNote(modeKey, notes);
 
         notes[modeKey] = {
             content,
             isExtend: pending
                 ? !!pending.isExtend
-                : previous.customized
-                    ? !!previous.isExtend
-                    : !!inherited?.isExtend,
+                : !!previous.isExtend,
             updatedAt: Date.now(),
             customized: true,
         };
@@ -1046,10 +1065,7 @@
 
         const notes = getModeNotes(chatId);
         const previous = notes[modeKey];
-        const effective = getEffectiveModeNote(modeKey, notes);
-        const isExtend = previous?.customized
-            ? !!previous.isExtend
-            : !!effective?.isExtend;
+        const isExtend = !!previous?.isExtend;
 
         pendingPresetSave = {
             chatId,
@@ -1214,16 +1230,14 @@
         let notes;
 
         try {
-            const storedNotes = getModeNotes(chatId);
-            const inheritsCurrent = !storedNotes[chatMode]?.customized;
-            notes = await ensureServerUserNoteAndGetPresets(chatId, inheritsCurrent);
+            notes = await ensureServerUserNoteAndGetPresets(chatId);
         } catch (err) {
             console.error('[채팅 모드 유저노트 프리셋 초기화]', err);
             showToast('프리셋 초기화 실패');
             return;
         }
 
-        const note = getEffectiveModeNote(chatMode, notes, currentServerUserNote);
+        const note = notes[chatMode];
 
         if (!note) {
             return;
