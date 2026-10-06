@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      2.1.2
+// @version      2.2.0
 // @description  Crack 유저노트 창에서 모델 프리셋을 자동 저장하고, 채팅 모드 변경 시 서버에 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -90,7 +90,7 @@
                 content: '',
                 isExtend: false,
                 updatedAt: null,
-                initialized: false,
+                customized: false,
             };
         });
 
@@ -102,19 +102,26 @@
                     !!entry.isExtend ||
                     !!entry.updatedAt
                 );
+                const hasExplicitCustomized = typeof entry?.customized === 'boolean';
+                const customized = hasExplicitCustomized
+                    ? entry.customized
+                    : !!entry && (entry.initialized === true || hasLegacyValue);
 
                 notes[mode.key] = {
-                    content: typeof entry?.content === 'string'
+                    content: customized && typeof entry?.content === 'string'
                         ? entry.content
                         : '',
-                    isExtend: !!entry?.isExtend,
-                    updatedAt: entry?.updatedAt || null,
-                    initialized: typeof entry?.initialized === 'boolean'
-                        ? entry.initialized
-                        : hasLegacyValue,
+                    isExtend: customized && !!entry?.isExtend,
+                    updatedAt: customized ? entry?.updatedAt || null : null,
+                    customized,
                 };
 
-                if (entry && typeof entry.initialized !== 'boolean') {
+                if (
+                    !entry ||
+                    !hasExplicitCustomized ||
+                    Object.prototype.hasOwnProperty.call(entry, 'initialized') ||
+                    (!customized && hasLegacyValue)
+                ) {
                     needsMigration = true;
                 }
             });
@@ -398,39 +405,35 @@
         }) || null;
     }
 
-    function initializeUninitializedPresets(serverNote) {
-        if (!serverNote) return getModeNotes();
+    function getEffectiveModeNote(modeKey, notes = getModeNotes(), serverNote = currentServerUserNote) {
+        const stored = notes?.[modeKey];
+        if (!stored) return null;
 
-        const notes = getModeNotes();
-        let changed = false;
-
-        CHAT_MODES.forEach(mode => {
-            if (notes[mode.key]?.initialized) return;
-
-            notes[mode.key] = {
-                content: serverNote.content || '',
-                isExtend: !!serverNote.isExtend,
-                updatedAt: Date.now(),
-                initialized: true,
+        if (stored.customized) {
+            return {
+                content: stored.content || '',
+                isExtend: !!stored.isExtend,
+                customized: true,
             };
-            changed = true;
-        });
-
-        if (changed) {
-            setModeNotes(notes);
         }
 
-        return notes;
+        if (!serverNote || serverNote.chatId !== parseChatId()) return null;
+
+        return {
+            content: serverNote.content || '',
+            isExtend: !!serverNote.isExtend,
+            customized: false,
+        };
     }
 
-    async function ensurePresetsInitialized(chatId) {
+    async function ensureServerUserNoteAndGetPresets(chatId, forceRefresh = false) {
         if (!chatId) return getModeNotes();
 
         let serverNote = currentServerUserNote?.chatId === chatId
             ? currentServerUserNote
             : null;
 
-        if (!serverNote) {
+        if (!serverNote || forceRefresh) {
             const fetched = await fetchCurrentUserNote(chatId);
             serverNote = {
                 chatId,
@@ -441,7 +444,7 @@
             currentServerUserNote = serverNote;
         }
 
-        return initializeUninitializedPresets(serverNote);
+        return getModeNotes(chatId);
     }
 
     async function syncVisibleUserNoteUIFromAppliedThenServer() {
@@ -477,13 +480,19 @@
                 fetchedAt: Date.now(),
             };
 
-            initializeUninitializedPresets(currentServerUserNote);
             renderModeTabs();
 
             const presetEditor = getPresetEditor();
+            const selectedNote = selectedPresetMode
+                ? getModeNotes(chatId)[selectedPresetMode]
+                : null;
             if (
                 selectedPresetMode &&
-                (presetEditor?.hidden || presetEditor?.dataset.modeKey !== selectedPresetMode)
+                (
+                    !selectedNote?.customized ||
+                    presetEditor?.hidden ||
+                    presetEditor?.dataset.modeKey !== selectedPresetMode
+                )
             ) {
                 showPresetEditor(textarea, selectedPresetMode);
             }
@@ -541,15 +550,18 @@
         }
 
         const notes = getModeNotes();
+        const storedNote = notes[modeKey];
 
-        notes[modeKey] = {
-            content,
-            isExtend,
-            updatedAt: Date.now(),
-            initialized: true,
-        };
+        if (storedNote?.customized) {
+            notes[modeKey] = {
+                content,
+                isExtend,
+                updatedAt: Date.now(),
+                customized: true,
+            };
+            setModeNotes(notes);
+        }
 
-        setModeNotes(notes);
         lastSuccessfulUserNoteChatId = chatId;
         lastSuccessfulUserNoteModeKey = modeKey;
         rememberLastAppliedNote(chatId, modeKey, content, isExtend);
@@ -918,7 +930,7 @@
         renderModeTabs();
         if (!selectedPresetMode) {
             showCurrentEditor(textarea);
-        } else if (getModeNotes()[selectedPresetMode]?.initialized) {
+        } else if (getModeNotes()[selectedPresetMode]) {
             showPresetEditor(textarea, selectedPresetMode);
         }
         return container;
@@ -952,12 +964,14 @@
         const presetEditor = getPresetEditor();
         if (!textarea || !presetEditor || !modeKey) return;
 
-        const note = getModeNotes()[modeKey];
-        if (!note?.initialized) return;
+        const notes = getModeNotes();
+        const note = getEffectiveModeNote(modeKey, notes);
+        if (!note) return;
 
         const stableHeight = getStableEditorHeight(textarea);
         presetEditor.dataset.stableHeight = String(stableHeight);
         presetEditor.dataset.modeKey = modeKey;
+        presetEditor.dataset.customized = note.customized ? 'true' : 'false';
         presetEditor.value = note.content || '';
         presetEditor.maxLength = note.isExtend ? 2000 : 500;
         presetEditor.placeholder = `${getModeLabel(modeKey)} 프리셋`;
@@ -988,14 +1002,19 @@
             content: '',
             isExtend: false,
             updatedAt: null,
-            initialized: true,
+            customized: false,
         };
+        const inherited = getEffectiveModeNote(modeKey, notes);
 
         notes[modeKey] = {
             content,
-            isExtend: !!previous.isExtend,
+            isExtend: pending
+                ? !!pending.isExtend
+                : previous.customized
+                    ? !!previous.isExtend
+                    : !!inherited?.isExtend,
             updatedAt: Date.now(),
-            initialized: true,
+            customized: true,
         };
 
         setModeNotes(notes, chatId);
@@ -1025,11 +1044,31 @@
 
         if (!editor || !chatId || !modeKey || editor.dataset.modeKey !== modeKey) return;
 
+        const notes = getModeNotes(chatId);
+        const previous = notes[modeKey];
+        const effective = getEffectiveModeNote(modeKey, notes);
+        const isExtend = previous?.customized
+            ? !!previous.isExtend
+            : !!effective?.isExtend;
+
         pendingPresetSave = {
             chatId,
             modeKey,
             content: editor.value || '',
+            isExtend,
         };
+
+        if (!previous?.customized) {
+            notes[modeKey] = {
+                content: editor.value || '',
+                isExtend,
+                updatedAt: Date.now(),
+                customized: true,
+            };
+            setModeNotes(notes, chatId);
+            editor.dataset.customized = 'true';
+            renderModeTabs();
+        }
 
         clearTimeout(presetSaveTimer);
         presetSaveTimer = setTimeout(() => {
@@ -1056,7 +1095,7 @@
         }
 
         try {
-            await ensurePresetsInitialized(chatId);
+            await ensureServerUserNoteAndGetPresets(chatId);
         } catch (err) {
             console.error('[채팅모드별 유저노트 자동변경] 프리셋 초기화 실패', err);
             if (selectedPresetMode === modeKey) {
@@ -1175,20 +1214,22 @@
         let notes;
 
         try {
-            notes = await ensurePresetsInitialized(chatId);
+            const storedNotes = getModeNotes(chatId);
+            const inheritsCurrent = !storedNotes[chatMode]?.customized;
+            notes = await ensureServerUserNoteAndGetPresets(chatId, inheritsCurrent);
         } catch (err) {
             console.error('[채팅 모드 유저노트 프리셋 초기화]', err);
             showToast('프리셋 초기화 실패');
             return;
         }
 
-        const note = notes[chatMode];
+        const note = getEffectiveModeNote(chatMode, notes, currentServerUserNote);
 
         if (!note) {
             return;
         }
 
-        if (!note.content) {
+        if (!note.customized && !note.content) {
             return;
         }
 
