@@ -24,7 +24,7 @@
         { key: 'hyperchat_3_0', label: '하이퍼챗 3.0', shortLabel: 'H3' },
         { key: 'hyperchat_2_0', label: '하이퍼챗 2.0', shortLabel: 'H2' },
         { key: 'hyperchat_1_5', label: '하이퍼챗 1.5', shortLabel: 'H1.5' },
-        { key: 'hyperchat', label: '하이퍼챗', shortLabel: 'Hyper' },
+        { key: 'hyperchat', label: '하이퍼챗 1.0', shortLabel: 'H1.0' },
         { key: 'prochat_2_5', label: '프로챗 2.5', shortLabel: 'Pro2.5' },
         { key: 'prochat_1_0', label: '프로챗 1.0', shortLabel: 'Pro1.0' },
     ];
@@ -679,7 +679,7 @@
             min-height: 38px;
             box-sizing: border-box;
             margin: 0 0 8px;
-            overflow: hidden;
+            overflow: visible;
             color: inherit;
             font-family: inherit;
             font-size: 12px;
@@ -692,12 +692,17 @@
             width: 100%;
             height: 38px;
             box-sizing: border-box;
-            padding: 1px 2px 5px;
+            padding: 3px 2px;
             overflow-x: auto;
             overflow-y: hidden;
             overscroll-behavior-x: contain;
-            scrollbar-width: thin;
+            scrollbar-width: none;
             -webkit-overflow-scrolling: touch;
+        }
+
+        .mun-chip-scroll::-webkit-scrollbar {
+            width: 0;
+            height: 0;
         }
 
         .mun-chip {
@@ -1196,7 +1201,12 @@
                 fetchedAt: Date.now(),
             };
 
-            renderModeTabs();
+            try {
+                await selectEditorView(chatMode);
+            } catch (uiErr) {
+                console.warn('[채팅 모드 유저노트 자동 적용] 적용 후 탭 전환 실패', uiErr);
+                renderModeTabs();
+            }
             showToast(`${getModeShortLabel(chatMode)} 유저노트 적용됨`);
         } catch (err) {
             console.error('[채팅 모드 유저노트 자동 적용]', err);
