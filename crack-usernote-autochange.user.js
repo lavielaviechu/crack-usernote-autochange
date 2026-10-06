@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      2.2.1
+// @version      2.2.2
 // @description  Crack 유저노트 창에서 모델 프리셋을 자동 저장하고, 채팅 모드 변경 시 서버에 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -91,6 +91,7 @@
                 isExtend: false,
                 updatedAt: null,
                 customized: false,
+                userEdited: false,
             };
         });
 
@@ -103,22 +104,36 @@
                     !!entry.updatedAt
                 );
                 const hasExplicitCustomized = typeof entry?.customized === 'boolean';
-                const customized = hasExplicitCustomized
+                const hasUserEditMarker = entry?.userEdited === true;
+                const rawContent = typeof entry?.content === 'string'
+                    ? entry.content
+                    : '';
+                const legacyCustomized = hasExplicitCustomized
                     ? entry.customized
                     : !!entry && (entry.initialized === true || hasLegacyValue);
+                const recoveredEmptyCustomized =
+                    rawContent === '' &&
+                    !hasUserEditMarker &&
+                    legacyCustomized;
+                const customized =
+                    hasUserEditMarker ||
+                    (legacyCustomized && !recoveredEmptyCustomized);
 
                 notes[mode.key] = {
-                    content: typeof entry?.content === 'string'
-                        ? entry.content
-                        : '',
+                    content: rawContent,
                     isExtend: !!entry?.isExtend,
-                    updatedAt: entry?.updatedAt || null,
+                    updatedAt: recoveredEmptyCustomized
+                        ? null
+                        : entry?.updatedAt || null,
                     customized,
+                    userEdited: customized,
                 };
 
                 if (
                     !entry ||
                     !hasExplicitCustomized ||
+                    typeof entry?.userEdited !== 'boolean' ||
+                    recoveredEmptyCustomized ||
                     Object.prototype.hasOwnProperty.call(entry, 'initialized')
                 ) {
                     needsMigration = true;
@@ -420,6 +435,7 @@
                 isExtend: !!serverNote.isExtend,
                 updatedAt,
                 customized: false,
+                userEdited: false,
             };
             changed = true;
         });
@@ -567,12 +583,23 @@
                 isExtend,
                 updatedAt,
                 customized: false,
+                userEdited: false,
             };
             synchronized = true;
         });
 
         if (synchronized) {
             setModeNotes(notes);
+
+            if (
+                selectedPresetMode &&
+                !notes[selectedPresetMode]?.customized
+            ) {
+                const textarea = getNativeUserNoteTextarea();
+                if (textarea) {
+                    showPresetEditor(textarea, selectedPresetMode);
+                }
+            }
         }
 
         const knownMode = CHAT_MODES.some(mode => mode.key === modeKey);
@@ -1025,6 +1052,7 @@
             isExtend: false,
             updatedAt: null,
             customized: false,
+            userEdited: false,
         };
 
         notes[modeKey] = {
@@ -1034,6 +1062,7 @@
                 : !!previous.isExtend,
             updatedAt: Date.now(),
             customized: true,
+            userEdited: true,
         };
 
         setModeNotes(notes, chatId);
@@ -1080,6 +1109,7 @@
                 isExtend,
                 updatedAt: Date.now(),
                 customized: true,
+                userEdited: true,
             };
             setModeNotes(notes, chatId);
             editor.dataset.customized = 'true';
