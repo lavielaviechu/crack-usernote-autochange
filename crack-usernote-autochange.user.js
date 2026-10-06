@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 채팅모드별 유저노트 자동변경
 // @namespace    http://tampermonkey.net/
-// @version      2.1.1
+// @version      2.1.2
 // @description  Crack 유저노트 창에서 모델 프리셋을 자동 저장하고, 채팅 모드 변경 시 서버에 자동 적용합니다.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_setValue
@@ -44,6 +44,7 @@
     let lastAppliedUserNoteMode = '';
 
     let lastSeenUserNoteTextarea = null;
+    let shouldSelectAppliedModeOnOpen = true;
     let userNoteUiSyncScheduled = false;
 
     let internalPatchInProgress = false;
@@ -451,6 +452,16 @@
         if (!textarea) return;
 
         lastSeenUserNoteTextarea = textarea;
+
+        if (shouldSelectAppliedModeOnOpen && !selectedPresetMode) {
+            const appliedMode = getCurrentAppliedModeForChat();
+
+            if (CHAT_MODES.some(mode => mode.key === appliedMode)) {
+                selectedPresetMode = appliedMode;
+            }
+        }
+        shouldSelectAppliedModeOnOpen = false;
+
         ensureInlineEditorUI(textarea);
         renderModeTabs();
 
@@ -1257,6 +1268,7 @@
             flushPresetAutoSave(false);
             lastSeenUserNoteTextarea = null;
             selectedPresetMode = '';
+            shouldSelectAppliedModeOnOpen = true;
             currentServerUserNote = null;
         }
 
@@ -1273,6 +1285,7 @@
             lastSeenUserNoteTextarea = null;
             pendingUserNotePatchMode = null;
             selectedPresetMode = '';
+            shouldSelectAppliedModeOnOpen = true;
             currentServerUserNote = null;
 
             setTimeout(() => {
